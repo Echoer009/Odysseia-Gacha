@@ -1,0 +1,22 @@
+# --- Environment & Secrets ---
+# Ignore the .env file containing the bot token and other secrets.
+.env
+
+# --- Database & Config Files ---
+# Ignore the SQLite database file.
+posts.db
+# Ignore the server-specific configuration file.
+config.json
+
+# --- Python ---
+# Ignore Python bytecode files and cache directories.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- IDE & OS specific ---
+# Ignore VSCode settings
+.vscode/
+# Ignore macOS specific files
+.DS_Store

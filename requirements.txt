@@ -1,0 +1,5 @@
+# requirements.txt
+# 项目所需的所有 Python 依赖库
+
+discord.py>=2.3.2
+python-dotenv>=1.0.0
