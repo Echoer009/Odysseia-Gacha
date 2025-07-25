@@ -7,17 +7,8 @@ import os
 import random
 import sqlite3
 
-# --- 配置文件路径 ---
-CONFIG_FILE = 'config.json'
+# --- 数据库文件路径 ---
 DB_FILE = 'posts.db'
-
-# --- 辅助函数：加载配置 ---
-def load_config():
-    """加载配置文件。"""
-    if not os.path.exists(CONFIG_FILE) or os.path.getsize(CONFIG_FILE) == 0:
-        return {}
-    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
 
 # --- 数据库初始化 ---
 def init_db():
@@ -91,17 +82,16 @@ class PoolSelectView(discord.ui.View):
     def create_pool_select(self, guild_id: int):
         """动态创建支持多选的卡池选择下拉菜单。"""
         options = [discord.SelectOption(label="默认卡池 (所有卡池)", value="all")]
-        config = load_config()
-        guild_config = config.get(str(guild_id))
         
+        # 直接从 bot 实例获取监控频道列表
+        forum_ids = self.bot.allowed_forum_ids
         valid_options_count = 0
-        if guild_config:
-            forum_ids = guild_config.get("forum_channels", [])
-            for forum_id in forum_ids:
-                channel = self.bot.get_channel(forum_id)
-                if channel and isinstance(channel, discord.ForumChannel):
-                    options.append(discord.SelectOption(label=f"卡池: {channel.name}", value=str(channel.id)))
-                    valid_options_count += 1
+        for forum_id in forum_ids:
+            # 确保频道属于当前服务器
+            channel = self.bot.get_channel(forum_id)
+            if channel and channel.guild.id == guild_id and isinstance(channel, discord.ForumChannel):
+                options.append(discord.SelectOption(label=f"卡池: {channel.name}", value=str(channel.id)))
+                valid_options_count += 1
         
         select = discord.ui.Select(
             placeholder="选择你的专属卡池 (可多选)...",
@@ -177,10 +167,15 @@ class RandomPostView(discord.ui.View):
 
             # 如果没有偏好或偏好是 "all"，则获取服务器所有监控的论坛
             if not target_forum_ids:
-                config = load_config()
-                guild_config = config.get(str(guild_id))
-                if guild_config:
-                    target_forum_ids = guild_config.get("forum_channels", [])
+                # 直接从 bot 实例获取所有监控的论坛ID
+                all_allowed_ids = self.bot.allowed_forum_ids
+                # 筛选出属于当前服务器的频道
+                guild_channels = []
+                for channel_id in all_allowed_ids:
+                    channel = self.bot.get_channel(channel_id)
+                    if channel and channel.guild.id == guild_id:
+                        guild_channels.append(channel_id)
+                target_forum_ids = guild_channels
 
             if not target_forum_ids:
                 await interaction.followup.send("🤔 无法抽卡：管理员尚未配置任何监控论坛，或者您选择的卡池为空。", ephemeral=True)

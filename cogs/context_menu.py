@@ -13,27 +13,47 @@ async def back_to_top(interaction: discord.Interaction, message: discord.Message
     """
     # 检查命令是否在帖子（Thread）中被调用
     if isinstance(interaction.channel, discord.Thread):
+        # 场景一：在帖子内，提供回到帖子顶部的链接
         thread = interaction.channel
-        
-        # 创建一个包含跳转链接的按钮
         view = discord.ui.View()
         button = discord.ui.Button(
             label=f"🚀 点击回到《{thread.name}》顶部",
             style=discord.ButtonStyle.link,
-            url=thread.jump_url
+            url=f"{thread.jump_url}/0"
         )
         view.add_item(button)
-
-        # 以仅自己可见的方式回复消息
         await interaction.response.send_message(
             content="这是您请求的帖子顶部跳转链接：",
             view=view,
             ephemeral=True
         )
+    elif isinstance(interaction.channel, discord.TextChannel):
+        # 场景二：在普通文本频道，提供跳转到频道最顶部的链接
+        try:
+            # 尝试获取频道的第一条消息
+            first_message = [msg async for msg in interaction.channel.history(limit=1, oldest_first=True)][0]
+            view = discord.ui.View()
+            button = discord.ui.Button(
+                label=f"🚀 点击回到 #{interaction.channel.name} 的开头",
+                style=discord.ButtonStyle.link,
+                url=first_message.jump_url
+            )
+            view.add_item(button)
+            await interaction.response.send_message(
+                content="这是您请求的频道顶部跳转链接：",
+                view=view,
+                ephemeral=True
+            )
+        except (IndexError, discord.Forbidden):
+            # 如果频道为空或没有权限读取历史消息
+            await interaction.response.send_message(
+                "❌ 无法获取该频道的起始消息（可能为空或权限不足）。",
+                ephemeral=True
+            )
     else:
-        # 如果不在帖子中，则发送错误提示
+        # 其他情况（例如私信、语音频道文本区等）
         await interaction.response.send_message(
-            "❌ 此命令只能在论坛的帖子内部使用。",
+            "❌ 此命令仅支持在服务器的帖子或文本频道中使用。",
             ephemeral=True
         )
 

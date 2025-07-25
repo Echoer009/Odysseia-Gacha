@@ -4,6 +4,7 @@ from discord.ext import commands
 from discord import app_commands
 import sqlite3
 import os
+import json
 
 DB_FILE = 'posts.db'
 
@@ -89,6 +90,37 @@ class PresetReplyView(discord.ui.View):
     def __init__(self, presets: list[str], target_message: discord.Message, timeout=180):
         super().__init__(timeout=timeout)
         self.add_item(PresetReplySelect(presets, target_message))
+
+# --- 新增：用于搜索的模态框 ---
+class PresetSearchModal(discord.ui.Modal, title="搜索预设消息"):
+    keyword = discord.ui.TextInput(
+        label="输入关键词搜索",
+        placeholder="输入关键词以筛选预设消息...",
+        required=False, # 允许为空，表示显示所有
+        style=discord.TextStyle.short
+    )
+
+    def __init__(self, target_message: discord.Message):
+        super().__init__()
+        self.target_message = target_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        search_term = self.keyword.value.lower()
+        
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        # 使用 LIKE 进行模糊搜索
+        cur.execute("SELECT name FROM preset_messages WHERE guild_id = ? AND name LIKE ?", (interaction.guild.id, f'%{search_term}%'))
+        search_results = [row[0] for row in cur.fetchall()]
+        con.close()
+
+        if not search_results:
+            await interaction.response.send_message(f"找不到包含 `{self.keyword.value}` 的预设消息。", ephemeral=True)
+            return
+
+        # 将搜索结果以新的视图（包含下拉菜单）发送
+        view = PresetReplyView(search_results, self.target_message)
+        await interaction.response.send_message("请从搜索结果中选择：", view=view, ephemeral=True)
 
 class PresetMessageCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -194,21 +226,140 @@ class PresetMessageCog(commands.Cog):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    @preset_group.command(name="导入json", description="上传一个JSON文件来批量导入预设消息 (仅限管理员)")
+    @app_commands.describe(attachment="包含预设消息的JSON文件")
+    async def import_presets(self, interaction: discord.Interaction, attachment: discord.Attachment):
+        """通过上传的JSON文件批量导入预设消息。"""
+        # --- 权限检查 (复用 PRESET_CREATOR_ROLE_IDS) ---
+        creator_role_ids_str = os.getenv("PRESET_CREATOR_ROLE_IDS", "")
+        if not creator_role_ids_str:
+            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `PRESET_CREATOR_ROLE_IDS`。", ephemeral=True)
+            return
+        creator_role_ids = {int(rid.strip()) for rid in creator_role_ids_str.split(',')}
+        user_roles = {role.id for role in interaction.user.roles}
+        if not user_roles.intersection(creator_role_ids):
+            await interaction.response.send_message("🚫 **权限不足**：只有拥有特定身份组的用户才能执行此操作。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            # 检查文件类型
+            if not attachment.filename.lower().endswith('.json'):
+                await interaction.followup.send("❌ **文件类型错误**：请上传一个 `.json` 文件。", ephemeral=True)
+                return
+
+            # 读取附件内容
+            file_content = await attachment.read()
+            data_to_import = json.loads(file_content.decode('utf-8'))
+
+            if not isinstance(data_to_import, list):
+                await interaction.followup.send("❌ **格式错误**：JSON 文件的顶层结构必须是一个数组 `[...]`。", ephemeral=True)
+                return
+
+            con = sqlite3.connect(DB_FILE)
+            cur = con.cursor()
+            
+            added_count = 0
+            skipped_count = 0
+            error_list = []
+
+            for item in data_to_import:
+                if not isinstance(item, dict) or 'name' not in item or 'value' not in item:
+                    error_list.append(f"无效条目: `{item}` (缺少 name 或 value)")
+                    continue
+                
+                preset_name = item['name']
+                preset_content = item['value']
+
+                try:
+                    cur.execute(
+                        "INSERT INTO preset_messages (guild_id, name, content, creator_id) VALUES (?, ?, ?, ?)",
+                        (interaction.guild.id, preset_name, preset_content, interaction.user.id)
+                    )
+                    added_count += 1
+                except sqlite3.IntegrityError:
+                    skipped_count += 1
+            
+            con.commit()
+            con.close()
+
+            report = [f"✅ **导入成功:** {added_count} 条"]
+            if skipped_count > 0:
+                report.append(f"ℹ️ **跳过 (名称已存在):** {skipped_count} 条")
+            if error_list:
+                report.append(f"❌ **格式错误:**\n" + "\n".join(error_list))
+                
+            await interaction.followup.send("\n".join(report), ephemeral=True)
+
+        except Exception as e:
+            # 捕获所有其他潜在错误，防止命令卡住
+            print(f"[导入错误] {type(e).__name__}: {e}")
+            await interaction.followup.send(f"❌ **发生未知错误**：导入过程中断。\n请检查控制台日志以获取详细信息。\n`{e}`", ephemeral=True)
+
 
     async def reply_with_preset_context_menu(self, interaction: discord.Interaction, message: discord.Message):
-        """右键菜单命令的回调函数。"""
+        """右键菜单命令的回调函数，现在弹出搜索模态框。"""
+        # 检查服务器是否有任何预设消息
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
-        cur.execute("SELECT name FROM preset_messages WHERE guild_id = ?", (interaction.guild.id,))
+        cur.execute("SELECT 1 FROM preset_messages WHERE guild_id = ? LIMIT 1", (interaction.guild.id,))
+        has_presets = cur.fetchone()
+        con.close()
+
+        if not has_presets:
+            await interaction.response.send_message("ℹ️ 当前服务器还没有任何预设消息，无法进行回复。", ephemeral=True)
+            return
+            
+        # 弹出搜索模态框，并将目标消息传递过去
+        modal = PresetSearchModal(target_message=message)
+        await interaction.response.send_modal(modal)
+
+    # --- 修改后的斜杠命令：通过@用户发送 ---
+    @preset_group.command(name="发送给", description="通过@用户并发送预设消息。")
+    @app_commands.describe(
+        user="要@的用户",
+        name="要使用的预设消息的名称"
+    )
+    async def reply_with_preset_slash(self, interaction: discord.Interaction, user: discord.Member, name: str):
+        """通过@用户并发送预设消息，模拟回复效果。"""
+        # 1. 从数据库获取预设内容
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        cur.execute("SELECT content FROM preset_messages WHERE guild_id = ? AND name = ?", (interaction.guild.id, name))
+        row = cur.fetchone()
+        con.close()
+
+        if not row:
+            await interaction.response.send_message(f"❌ **错误**：找不到名为 `{name}` 的预设消息。请检查您的输入。", ephemeral=True)
+            return
+        
+        # 2. 构造并发送消息
+        content = row[0]
+        # 构造提及用户的消息
+        message_to_send = f"{user.mention}\n{content}"
+
+        try:
+            # 在当前频道发送消息，因为没有原始消息可以回复
+            await interaction.channel.send(message_to_send)
+            # 确认交互成功
+            await interaction.response.send_message(f"✅ 已向 {user.display_name} 发送预设消息 `{name}`。", ephemeral=True)
+        except discord.HTTPException as e:
+            await interaction.response.send_message(f"❌ **发送失败**：无法发送消息。\n`{e}`", ephemeral=True)
+
+    @reply_with_preset_slash.autocomplete('name')
+    async def reply_with_preset_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        """为 /preset_reply 命令的 name 参数提供自动补全。"""
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        cur.execute("SELECT name FROM preset_messages WHERE guild_id = ? AND name LIKE ?", (interaction.guild.id, f'%{current}%'))
         all_presets = [row[0] for row in cur.fetchall()]
         con.close()
 
-        if not all_presets:
-            await interaction.response.send_message("ℹ️ 当前服务器还没有任何预设消息，无法进行回复。", ephemeral=True)
-            return
-
-        view = PresetReplyView(all_presets, message)
-        await interaction.response.send_message("请选择要用于回复的预设消息：", view=view, ephemeral=True)
+        return [
+            app_commands.Choice(name=preset, value=preset)
+            for preset in all_presets
+        ][:25] # Autocomplete最多只能显示25个选项
 
 
 async def setup(bot: commands.Bot):

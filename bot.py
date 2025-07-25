@@ -5,33 +5,37 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import asyncio
 from typing import Literal, Optional
+import json
 
 # --- 初始化 ---
 # 加载 .env 文件中的环境变量
 load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-# 加载测试服务器ID，用于快速同步
-GUILD_ID = os.getenv("GUILD_ID") 
+GUILD_ID = os.getenv("GUILD_ID")
+ALLOWED_CHANNEL_IDS_STR = os.getenv("ALLOWED_CHANNEL_IDS", "")
+DELIVERY_CHANNEL_ID_STR = os.getenv("DELIVERY_CHANNEL_ID", "")
 
 # --- Bot 设置 ---
 # 创建一个 Bot 实例，并启用所有默认的 Intents
-# 为了 on_thread_create 和 on_message 事件，members 和 message_content intents 是必需的
 intents = discord.Intents.default()
 intents.guilds = True
 intents.messages = True
-intents.message_content = True  # 需要在开发者门户中启用
-intents.members = True # 需要在开发者门户中启用
+intents.message_content = True
+intents.members = True
 
 class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
+        # --- 统一配置处理 ---
+        self.allowed_forum_ids = {int(cid.strip()) for cid in ALLOWED_CHANNEL_IDS_STR.split(',') if cid.strip()}
+        self.delivery_channel_id = int(DELIVERY_CHANNEL_ID_STR) if DELIVERY_CHANNEL_ID_STR else None
 
     async def setup_hook(self):
         """
         这个函数会在机器人登录时被调用，用于加载 Cogs 和同步命令。
         """
+        # --- 加载 Cogs ---
         print("--- 正在加载 Cogs ---")
-        # 遍历 cogs 文件夹并加载所有 .py 文件
         for filename in os.listdir('./cogs'):
             if filename.endswith('.py') and not filename.startswith('__'):
                 try:
@@ -61,18 +65,42 @@ class MyBot(commands.Bot):
         print(f'🚀 {self.user} 已成功登录并准备就绪!')
         print(f'机器人ID: {self.user.id}')
         print(f'监控服务器数量: {len(self.guilds)}')
-        # --- 新增：打印已注册的命令 ---
-        print("\n--- 正在获取已注册的命令列表 ---")
+
+        # --- 打印 .env 配置信息 ---
+        print("\n--- 正在加载 .env 配置 ---")
+        if self.allowed_forum_ids:
+            print(f"✅ 成功加载 {len(self.allowed_forum_ids)} 个监控论坛频道:")
+            # 为了美观，我们尝试获取频道名称
+            for channel_id in self.allowed_forum_ids:
+                channel = self.get_channel(channel_id)
+                if channel:
+                    print(f"  - {channel.name} (ID: {channel_id})")
+                else:
+                    print(f"  - 未找到频道 (ID: {channel_id})")
+        else:
+            print("⚠️ 未在 .env 文件中找到或加载任何 ALLOWED_CHANNEL_IDS。")
+
+        if self.delivery_channel_id:
+            channel = self.get_channel(self.delivery_channel_id)
+            if channel:
+                print(f"✅ 速递频道已设置为: {channel.name} (ID: {self.delivery_channel_id})")
+            else:
+                print(f"⚠️ 未找到速递频道 (ID: {self.delivery_channel_id})")
+        else:
+            print("ℹ️ 未在 .env 文件中配置速递频道 (DELIVERY_CHANNEL_ID)。")
+        print("--- .env 配置加载完毕 ---\n")
+
+
+        # --- 打印已注册的命令 ---
+        print("--- 正在获取已注册的命令列表 ---")
         guild_id = os.getenv("GUILD_ID")
         cmd_list = []
         location = "全局"
         if guild_id:
-            # 如果提供了测试服务器ID，就从该服务器获取命令
             guild = discord.Object(id=int(guild_id))
             cmd_list = await self.tree.fetch_commands(guild=guild)
             location = f"测试服务器 (ID: {guild_id})"
         else:
-            # 否则获取全局命令
             cmd_list = await self.tree.fetch_commands()
 
         print(f"--- ✅ 在 [{location}] 共找到 {len(cmd_list)} 条命令 ---")
