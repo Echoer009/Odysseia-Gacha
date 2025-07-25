@@ -6,6 +6,7 @@ from discord.ext import tasks
 import os
 import sqlite3
 from typing import Optional
+from dotenv import set_key, unset_key
 
 # --- 数据库文件路径 ---
 DB_FILE = 'posts.db'
@@ -77,9 +78,10 @@ class ForumTools(commands.Cog):
                     if thread.id > last_id:
                         new_threads.append(thread)
 
-                # 检查归档帖子
-                async for thread in forum.archived_threads(after=discord.Object(id=last_id)):
-                    new_threads.append(thread)
+                # 检查归档帖子 (该方法不支持 'after' 参数, 我们在内存中过滤)
+                async for thread in forum.archived_threads(limit=None):
+                    if thread.id > last_id:
+                        new_threads.append(thread)
 
                 if new_threads:
                     # 去重，以防万一有帖子在活跃和归档中同时出现
@@ -222,6 +224,146 @@ class ForumTools(commands.Cog):
         con.close()
 
         await interaction.followup.send(f"✅ **全量同步完成！** 本次新增了 **{total_added}** 个帖子到总卡池中。", ephemeral=True)
+
+    @config_group.command(name="设置速递频道", description="【重要】设置或更新新帖速递的目标频道。")
+    @app_commands.describe(channel="要设置为速递目标的文本频道")
+    async def set_delivery_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        """处理设置速递频道的命令。"""
+        # --- 权限检查 (复用 ADMIN_ROLE_IDS) ---
+        admin_role_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
+        if not admin_role_ids_str:
+            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `ADMIN_ROLE_IDS`。", ephemeral=True)
+            return
+        admin_role_ids = {int(rid.strip()) for rid in admin_role_ids_str.split(',')}
+        user_roles = {role.id for role in interaction.user.roles}
+        if not user_roles.intersection(admin_role_ids):
+            await interaction.response.send_message("🚫 **权限不足**：只有拥有特定管理员身份组的用户才能执行此操作。", ephemeral=True)
+            return
+        
+        try:
+            # 获取 .env 文件的路径
+            dotenv_path = os.path.join(os.getcwd(), '.env')
+            # 使用 set_key 来更新 .env 文件
+            set_key(dotenv_path, "DELIVERY_CHANNEL_ID", str(channel.id))
+            
+            # 更新 bot 实例中的在内存中的值，以便立即生效（如果可能）
+            self.bot.delivery_channel_id = channel.id
+            
+            await interaction.response.send_message(
+                f"✅ **成功!** 新帖速递频道已更新为 {channel.mention}。\n"
+                f"**重要提示**: 此更改已写入 `.env` 文件，但为了确保所有功能完全同步，建议您在方便时**重启机器人**。",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ **写入 .env 文件失败**: `{e}`", ephemeral=True)
+
+    @config_group.command(name="移除速递频道", description="【重要】禁用新帖速递功能。")
+    async def unset_delivery_channel(self, interaction: discord.Interaction):
+        """处理移除速递频道的命令。"""
+        # --- 权限检查 (复用 ADMIN_ROLE_IDS) ---
+        admin_role_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
+        if not admin_role_ids_str:
+            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `ADMIN_ROLE_IDS`。", ephemeral=True)
+            return
+        admin_role_ids = {int(rid.strip()) for rid in admin_role_ids_str.split(',')}
+        user_roles = {role.id for role in interaction.user.roles}
+        if not user_roles.intersection(admin_role_ids):
+            await interaction.response.send_message("🚫 **权限不足**：只有拥有特定管理员身份组的用户才能执行此操作。", ephemeral=True)
+            return
+
+        try:
+            dotenv_path = os.path.join(os.getcwd(), '.env')
+            # 使用 unset_key 来移除 .env 文件中的键
+            unset_key(dotenv_path, "DELIVERY_CHANNEL_ID")
+
+            # 更新 bot 实例中的在内存中的值
+            self.bot.delivery_channel_id = None
+
+            await interaction.response.send_message(
+                f"✅ **成功!** 已禁用新帖速递功能。\n"
+                f"**重要提示**: 此更改已写入 `.env` 文件，但为了确保所有功能完全同步，建议您在方便时**重启机器人**。",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ **写入 .env 文件失败**: `{e}`", ephemeral=True)
+
+    @config_group.command(name="添加监控论坛", description="【重要】添加一个新的论坛频道到监控列表。")
+    @app_commands.describe(channel="要添加的论坛频道")
+    async def add_monitored_forum(self, interaction: discord.Interaction, channel: discord.ForumChannel):
+        """处理添加监控论坛的命令。"""
+        # --- 权限检查 ---
+        admin_role_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
+        if not admin_role_ids_str:
+            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `ADMIN_ROLE_IDS`。", ephemeral=True)
+            return
+        admin_role_ids = {int(rid.strip()) for rid in admin_role_ids_str.split(',')}
+        user_roles = {role.id for role in interaction.user.roles}
+        if not user_roles.intersection(admin_role_ids):
+            await interaction.response.send_message("🚫 **权限不足**。", ephemeral=True)
+            return
+
+        try:
+            dotenv_path = os.path.join(os.getcwd(), '.env')
+            # 读取现有配置
+            current_ids_str = os.getenv("ALLOWED_CHANNEL_IDS", "")
+            current_ids = {cid.strip() for cid in current_ids_str.split(',') if cid.strip()}
+            
+            # 添加新ID
+            current_ids.add(str(channel.id))
+            
+            # 写回 .env
+            new_ids_str = ",".join(current_ids)
+            set_key(dotenv_path, "ALLOWED_CHANNEL_IDS", new_ids_str)
+
+            # 更新内存中的配置
+            self.bot.allowed_forum_ids = {int(cid) for cid in current_ids}
+
+            await interaction.response.send_message(
+                f"✅ **成功!** 已将论坛频道 {channel.mention} 添加到监控列表。\n"
+                f"**重要提示**: 建议在方便时**重启机器人**以确保所有后台任务都使用最新配置。",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ **写入 .env 文件失败**: `{e}`", ephemeral=True)
+
+    @config_group.command(name="移除监控论坛", description="【重要】从监控列表中移除一个论坛频道。")
+    @app_commands.describe(channel="要移除的论坛频道")
+    async def remove_monitored_forum(self, interaction: discord.Interaction, channel: discord.ForumChannel):
+        """处理移除监控论坛的命令。"""
+        # --- 权限检查 ---
+        admin_role_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
+        if not admin_role_ids_str:
+            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `ADMIN_ROLE_IDS`。", ephemeral=True)
+            return
+        admin_role_ids = {int(rid.strip()) for rid in admin_role_ids_str.split(',')}
+        user_roles = {role.id for role in interaction.user.roles}
+        if not user_roles.intersection(admin_role_ids):
+            await interaction.response.send_message("🚫 **权限不足**。", ephemeral=True)
+            return
+
+        try:
+            dotenv_path = os.path.join(os.getcwd(), '.env')
+            # 读取现有配置
+            current_ids_str = os.getenv("ALLOWED_CHANNEL_IDS", "")
+            current_ids = {cid.strip() for cid in current_ids_str.split(',') if cid.strip()}
+
+            # 移除ID
+            current_ids.discard(str(channel.id))
+
+            # 写回 .env
+            new_ids_str = ",".join(current_ids)
+            set_key(dotenv_path, "ALLOWED_CHANNEL_IDS", new_ids_str)
+
+            # 更新内存中的配置
+            self.bot.allowed_forum_ids = {int(cid) for cid in current_ids}
+
+            await interaction.response.send_message(
+                f"✅ **成功!** 已将论坛频道 {channel.mention} 从监控列表中移除。\n"
+                f"**重要提示**: 建议在方便时**重启机器人**以确保所有后台任务都使用最新配置。",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ **写入 .env 文件失败**: `{e}`", ephemeral=True)
 
 
 # --- Cog 设置函数 ---
