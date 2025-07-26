@@ -28,10 +28,16 @@ class ForumTools(commands.Cog):
         
         # 动态修改任务的循环间隔并启动
         self.incremental_sync_task.change_interval(hours=sync_hours)
-        self.incremental_sync_task.start()
 
     def cog_unload(self):
         self.incremental_sync_task.cancel()
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """当Cog加载且Bot准备就绪后，安全地启动后台任务。"""
+        if not self.incremental_sync_task.is_running():
+            print("[ForumTools] Bot is ready, starting incremental_sync_task.")
+            self.incremental_sync_task.start()
 
     # 移除这里的硬编码时间, 在 __init__ 中动态设置
     @tasks.loop()
