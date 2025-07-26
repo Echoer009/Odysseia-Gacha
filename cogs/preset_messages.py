@@ -26,36 +26,6 @@ def init_preset_db():
     con.close()
 
 # 在模块加载时立即初始化数据库
-class PresetMessageModal(discord.ui.Modal, title="创建新的预设消息"):
-    name = discord.ui.TextInput(
-        label="预设名称 (用于调用)",
-        placeholder="例如：欢迎语",
-        required=True,
-        style=discord.TextStyle.short
-    )
-    content = discord.ui.TextInput(
-        label="预设内容",
-        placeholder="输入你想要设置为预设的完整消息内容...",
-        required=True,
-        style=discord.TextStyle.long
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        con = sqlite3.connect(DB_FILE)
-        cur = con.cursor()
-        try:
-            cur.execute(
-                "INSERT INTO preset_messages (guild_id, name, content, creator_id) VALUES (?, ?, ?, ?)",
-                (interaction.guild.id, self.name.value, self.content.value, interaction.user.id)
-            )
-            con.commit()
-            await interaction.response.send_message(f"✅ 预设消息 `{self.name.value}` 已成功创建！", ephemeral=True)
-        except sqlite3.IntegrityError:
-            await interaction.response.send_message(f"❌ **错误**：名为 `{self.name.value}` 的预设消息已存在。", ephemeral=True)
-        except Exception as e:
-            await interaction.response.send_message(f"❌ **数据库错误**：无法创建预设消息。\n`{e}`", ephemeral=True)
-        finally:
-            con.close()
 init_preset_db()
 
 class PresetReplySelect(discord.ui.Select):
@@ -136,25 +106,65 @@ class PresetMessageCog(commands.Cog):
 
     preset_group = app_commands.Group(name="预设消息", description="管理和发送预设消息")
 
-    @preset_group.command(name="添加", description="添加一个新的预设消息")
-    async def add_preset(self, interaction: discord.Interaction):
-        """处理添加预设消息的命令。"""
-        # --- 从 .env 加载配置 ---
+    @preset_group.command(name="添加", description="添加一个新的预设消息，可附带多张图片。")
+    @app_commands.describe(
+        name="预设的唯一名称",
+        content="预设的文本内容",
+        image1="（可选）要附加的第1张图片",
+        image2="（可选）要附加的第2张图片",
+        image3="（可选）要附加的第3张图片",
+        image4="（可选）要附加的第4张图片",
+        image5="（可选）要附加的第5张图片"
+    )
+    async def add_preset(self, interaction: discord.Interaction, name: str, content: str,
+                         image1: discord.Attachment = None,
+                         image2: discord.Attachment = None,
+                         image3: discord.Attachment = None,
+                         image4: discord.Attachment = None,
+                         image5: discord.Attachment = None):
+        """处理添加预设消息的命令，支持文本和最多5张可选图片。"""
+        # --- 权限检查 (复用逻辑) ---
         creator_role_ids_str = os.getenv("PRESET_CREATOR_ROLE_IDS", "")
         if not creator_role_ids_str:
             await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `PRESET_CREATOR_ROLE_IDS`。", ephemeral=True)
             return
-
         creator_role_ids = {int(rid.strip()) for rid in creator_role_ids_str.split(',')}
-        
-        # --- 权限检查 ---
         user_roles = {role.id for role in interaction.user.roles}
         if not user_roles.intersection(creator_role_ids):
             await interaction.response.send_message("🚫 **权限不足**：只有拥有特定身份组的用户才能执行此操作。", ephemeral=True)
             return
 
-        # --- 弹出表单 ---
-        await interaction.response.send_modal(PresetMessageModal())
+        # --- 准备要存入数据库的内容 ---
+        final_content = content
+        images = [img for img in [image1, image2, image3, image4, image5] if img is not None]
+
+        if images:
+            # 1. 验证所有附件是否都是图片
+            for image in images:
+                if not image.content_type or not image.content_type.startswith('image/'):
+                    await interaction.response.send_message(f"❌ **文件类型错误**：文件 `{image.filename}` 不是一个有效的图片文件。", ephemeral=True)
+                    return
+            
+            # 2. 如果全部有效，则附加所有URL
+            for image in images:
+                final_content += f"\n{image.url}"
+
+        # --- 数据库操作 ---
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO preset_messages (guild_id, name, content, creator_id) VALUES (?, ?, ?, ?)",
+                (interaction.guild.id, name, final_content, interaction.user.id)
+            )
+            con.commit()
+            await interaction.response.send_message(f"✅ 预设消息 `{name}` 已成功创建！", ephemeral=True)
+        except sqlite3.IntegrityError:
+            await interaction.response.send_message(f"❌ **错误**：名为 `{name}` 的预设消息已存在。", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ **数据库错误**：无法创建预设消息。\n`{e}`", ephemeral=True)
+        finally:
+            con.close()
 
     @preset_group.command(name="删除", description="删除一个已有的预设消息")
     @app_commands.describe(name="要删除的预设消息的名称")
