@@ -5,6 +5,7 @@ from discord import app_commands
 import sqlite3
 import os
 import json
+import re
 
 DB_FILE = 'posts.db'
 
@@ -43,23 +44,97 @@ class PresetReplySelect(discord.ui.Select):
         row = cur.fetchone()
         con.close()
 
-        if row:
-            content = row[0]
+        if not row:
+            await interaction.response.edit_message(content=f"❌ **错误**：找不到名为 `{preset_name}` 的预设消息。", view=None)
+            return
+
+        content = row[0]
+        
+        # --- 权限检查 ---
+        user_role_ids_str = os.getenv("PRESET_USER_ROLE_IDS", "")
+        # 如果没有配置，则默认拒绝，并提示服主进行配置
+        if not user_role_ids_str:
+            await interaction.response.edit_message(content="❌ **配置错误**：机器人管理员尚未配置 `PRESET_USER_ROLE_IDS`，无法使用此功能。", view=None)
+            return
+            
+        user_role_ids = {int(rid.strip()) for rid in user_role_ids_str.split(',')}
+        user_roles = {role.id for role in interaction.user.roles}
+
+        # 如果用户有权限
+        if user_roles.intersection(user_role_ids):
             try:
-                # 尝试回复目标消息
                 await self.target_message.reply(content)
-                # 用户要求移除成功提示，所以我们只在交互成功后静默处理
-                # 使用 edit a new message with no content to dismiss the "thinking" state
-                await interaction.response.edit_message(content="✅", view=None)
+                await interaction.response.edit_message(content="✅ **回复已发送！**", view=None)
             except discord.HTTPException as e:
                 await interaction.response.edit_message(content=f"❌ **回复失败**：无法发送消息。\n`{e}`", view=None)
+        # 如果用户没有权限
         else:
-            await interaction.response.send_message(f"❌ **错误**：找不到名为 `{preset_name}` 的预设消息。", ephemeral=True)
+            # 对于无权限用户，将消息内容作为临时消息发送给他们自己看
+            ephemeral_content = f"🚫 **权限不足，无法公开发送**\n\n**以下是仅您可见的消息内容：**\n---\n{content}"
+            await interaction.response.edit_message(content=ephemeral_content, view=None)
 
 class PresetReplyView(discord.ui.View):
     def __init__(self, presets: list[str], target_message: discord.Message, timeout=180):
         super().__init__(timeout=timeout)
         self.add_item(PresetReplySelect(presets, target_message))
+
+class FuzzySearchReplyView(discord.ui.View):
+    """
+    一个视图，为模糊搜索到的预设消息提供发送按钮。
+    """
+    def __init__(self, matched_presets: list[str], timeout=180):
+        super().__init__(timeout=timeout)
+        # 为每个匹配到的预设创建一个按钮，最多25个
+        for preset_name in matched_presets[:25]:
+            self.add_item(self.SendPresetButton(label=preset_name))
+
+    class SendPresetButton(discord.ui.Button):
+        def __init__(self, label: str):
+            # 使用 preset name 作为 label 和 custom_id 的一部分，确保唯一性
+            super().__init__(style=discord.ButtonStyle.secondary, label=label, custom_id=f"send_preset_{label}")
+
+        async def callback(self, interaction: discord.Interaction):
+            await interaction.response.defer() # 先确认交互，防止超时
+            preset_name = self.label
+
+            # --- 权限检查 ---
+            user_role_ids_str = os.getenv("PRESET_USER_ROLE_IDS", "")
+            if not user_role_ids_str:
+                await interaction.followup.send("❌ **配置错误**：机器人管理员尚未配置 `PRESET_USER_ROLE_IDS`，无法使用此功能。", ephemeral=True)
+                return
+            
+            user_role_ids = {int(rid.strip()) for rid in user_role_ids_str.split(',')}
+            user_roles = {role.id for role in interaction.user.roles}
+
+            # --- 获取预设内容 ---
+            con = sqlite3.connect(DB_FILE)
+            cur = con.cursor()
+            cur.execute("SELECT content FROM preset_messages WHERE guild_id = ? AND name = ?", (interaction.guild.id, preset_name))
+            row = cur.fetchone()
+            con.close()
+
+            if not row:
+                await interaction.followup.send(f"❌ **错误**：在数据库中找不到预设 `{preset_name}`，可能已被删除。", ephemeral=True)
+                return
+
+            content = row[0]
+
+            # --- 根据权限发送或拒绝 ---
+            if user_roles.intersection(user_role_ids):
+                try:
+                    await interaction.channel.send(content)
+                    # 成功发送后，编辑原消息，禁用所有按钮
+                    for item in self.view.children:
+                        item.disabled = True
+                    await interaction.edit_original_response(content=f"✅ **已发送预设消息**：`{preset_name}`", view=self.view)
+                except discord.HTTPException as e:
+                    await interaction.followup.send(f"❌ **发送失败**：\n`{e}`", ephemeral=True)
+            else:
+                # 对于无权限用户，将消息内容作为临时消息发送
+                for item in self.view.children:
+                    item.disabled = True
+                await interaction.edit_original_response(content=f"🚫 **权限不足**：`{preset_name}` 的内容已作为临时消息发送给您。", view=self.view)
+                await interaction.followup.send(content, ephemeral=True)
 
 # --- 新增：用于搜索的模态框 ---
 class PresetSearchModal(discord.ui.Modal, title="搜索预设消息"):
@@ -95,34 +170,33 @@ class PresetSearchModal(discord.ui.Modal, title="搜索预设消息"):
 class PresetMessageCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # 原有的右键菜单
         self.reply_context_menu = app_commands.ContextMenu(
             name='💬 使用预设消息回复',
             callback=self.reply_with_preset_context_menu,
         )
         self.bot.tree.add_command(self.reply_context_menu)
 
+        # 新增的右键菜单：从消息中检索
+        self.search_context_menu = app_commands.ContextMenu(
+            name='🔍从消息中检索预设消息',
+            callback=self.search_from_message_context_menu,
+        )
+        self.bot.tree.add_command(self.search_context_menu)
+
     async def cog_unload(self):
         self.bot.tree.remove_command(self.reply_context_menu.name, type=self.reply_context_menu.type)
+        self.bot.tree.remove_command(self.search_context_menu.name, type=self.search_context_menu.type)
 
     preset_group = app_commands.Group(name="预设消息", description="管理和发送预设消息")
 
-    @preset_group.command(name="添加", description="添加一个新的预设消息，可附带多张图片。")
+    @preset_group.command(name="添加", description="通过消息链接添加一个新的预设消息。")
     @app_commands.describe(
         name="预设的唯一名称",
-        content="预设的文本内容",
-        image1="（可选）要附加的第1张图片",
-        image2="（可选）要附加的第2张图片",
-        image3="（可选）要附加的第3张图片",
-        image4="（可选）要附加的第4张图片",
-        image5="（可选）要附加的第5张图片"
+        message_link="包含预设内容和图片的消息链接"
     )
-    async def add_preset(self, interaction: discord.Interaction, name: str, content: str,
-                         image1: discord.Attachment = None,
-                         image2: discord.Attachment = None,
-                         image3: discord.Attachment = None,
-                         image4: discord.Attachment = None,
-                         image5: discord.Attachment = None):
-        """处理添加预设消息的命令，支持文本和最多5张可选图片。"""
+    async def add_preset(self, interaction: discord.Interaction, name: str, message_link: str):
+        """通过解析一个消息链接来添加或更新预设消息。"""
         # --- 权限检查 (复用逻辑) ---
         creator_role_ids_str = os.getenv("PRESET_CREATOR_ROLE_IDS", "")
         if not creator_role_ids_str:
@@ -134,37 +208,175 @@ class PresetMessageCog(commands.Cog):
             await interaction.response.send_message("🚫 **权限不足**：只有拥有特定身份组的用户才能执行此操作。", ephemeral=True)
             return
 
-        # --- 准备要存入数据库的内容 ---
-        final_content = content
-        images = [img for img in [image1, image2, image3, image4, image5] if img is not None]
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
-        if images:
-            # 1. 验证所有附件是否都是图片
-            for image in images:
-                if not image.content_type or not image.content_type.startswith('image/'):
-                    await interaction.response.send_message(f"❌ **文件类型错误**：文件 `{image.filename}` 不是一个有效的图片文件。", ephemeral=True)
-                    return
-            
-            # 2. 如果全部有效，则附加所有URL
-            for image in images:
-                final_content += f"\n{image.url}"
+        # --- 从链接获取消息 ---
+        match = re.match(r'https://discord.com/channels/(\d+)/(\d+)/(\d+)', message_link)
+        if not match:
+            await interaction.followup.send("❌ **链接无效**：请输入一个有效的 Discord 消息链接。", ephemeral=True)
+            return
+
+        guild_id, channel_id, message_id = map(int, match.groups())
+
+        if guild_id != interaction.guild.id:
+            await interaction.followup.send("❌ **操作无效**：不能从其他服务器的消息创建预设。", ephemeral=True)
+            return
+
+        try:
+            channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                 await interaction.followup.send("❌ **频道类型错误**：链接必须指向一个文本频道或帖子。", ephemeral=True)
+                 return
+            message = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            await interaction.followup.send("❌ **错误**：找不到链接对应的消息，请检查链接是否正确或消息是否已被删除。", ephemeral=True)
+            return
+        except discord.Forbidden:
+            await interaction.followup.send("❌ **权限不足**：我没有权限读取该频道的消息。", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"❌ **未知错误**：获取消息时出错。\n`{e}`", ephemeral=True)
+            return
+
+        # --- 准备内容 ---
+        final_content = message.content
+        if message.attachments:
+            # 将所有附件的URL附加到内容后面
+            urls = [att.url for att in message.attachments]
+            if final_content: # 如果已有文本内容，则换行
+                final_content += "\n" + "\n".join(urls)
+            else: # 如果没有文本内容，直接就是url
+                final_content = "\n".join(urls)
+
 
         # --- 数据库操作 ---
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
         try:
+            # 使用 INSERT OR REPLACE 逻辑，如果存在同名预设则更新它
             cur.execute(
-                "INSERT INTO preset_messages (guild_id, name, content, creator_id) VALUES (?, ?, ?, ?)",
+                """
+                INSERT INTO preset_messages (guild_id, name, content, creator_id) 
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, name) DO UPDATE SET
+                content = excluded.content,
+                creator_id = excluded.creator_id;
+                """,
                 (interaction.guild.id, name, final_content, interaction.user.id)
             )
             con.commit()
-            await interaction.response.send_message(f"✅ 预设消息 `{name}` 已成功创建！", ephemeral=True)
-        except sqlite3.IntegrityError:
-            await interaction.response.send_message(f"❌ **错误**：名为 `{name}` 的预设消息已存在。", ephemeral=True)
+            await interaction.followup.send(f"✅ 预设消息 `{name}` 已成功创建/更新！", ephemeral=True)
+
         except Exception as e:
-            await interaction.response.send_message(f"❌ **数据库错误**：无法创建预设消息。\n`{e}`", ephemeral=True)
+            await interaction.followup.send(f"❌ **数据库错误**：无法创建或更新预设消息。\n`{e}`", ephemeral=True)
         finally:
             con.close()
+
+    @preset_group.command(name="覆盖", description="通过消息链接覆盖一个已有的预设消息。")
+    @app_commands.describe(
+        name="要覆盖的预设的名称",
+        message_link="包含新内容的消息链接"
+    )
+    async def override_preset(self, interaction: discord.Interaction, name: str, message_link: str):
+        """通过解析一个消息链接来覆盖一个已有的预设消息。"""
+        # --- 权限检查 (复用逻辑) ---
+        creator_role_ids_str = os.getenv("PRESET_CREATOR_ROLE_IDS", "")
+        if not creator_role_ids_str:
+            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `PRESET_CREATOR_ROLE_IDS`。", ephemeral=True)
+            return
+        creator_role_ids = {int(rid.strip()) for rid in creator_role_ids_str.split(',')}
+        user_roles = {role.id for role in interaction.user.roles}
+        if not user_roles.intersection(creator_role_ids):
+            await interaction.response.send_message("🚫 **权限不足**：只有拥有特定身份组的用户才能执行此操作。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # --- 检查预设是否存在 ---
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        cur.execute("SELECT id FROM preset_messages WHERE guild_id = ? AND name = ?", (interaction.guild.id, name))
+        if not cur.fetchone():
+            con.close()
+            await interaction.followup.send(f"❌ **错误**：找不到名为 `{name}` 的预设消息，无法覆盖。", ephemeral=True)
+            return
+        con.close()
+
+
+        # --- 从链接获取消息 ---
+        match = re.match(r'https://discord.com/channels/(\d+)/(\d+)/(\d+)', message_link)
+        if not match:
+            await interaction.followup.send("❌ **链接无效**：请输入一个有效的 Discord 消息链接。", ephemeral=True)
+            return
+
+        guild_id, channel_id, message_id = map(int, match.groups())
+
+        if guild_id != interaction.guild.id:
+            await interaction.followup.send("❌ **操作无效**：不能从其他服务器的消息创建预设。", ephemeral=True)
+            return
+
+        try:
+            channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                 await interaction.followup.send("❌ **频道类型错误**：链接必须指向一个文本频道或帖子。", ephemeral=True)
+                 return
+            message = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            await interaction.followup.send("❌ **错误**：找不到链接对应的消息，请检查链接是否正确或消息是否已被删除。", ephemeral=True)
+            return
+        except discord.Forbidden:
+            await interaction.followup.send("❌ **权限不足**：我没有权限读取该频道的消息。", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"❌ **未知错误**：获取消息时出错。\n`{e}`", ephemeral=True)
+            return
+
+        # --- 准备内容 ---
+        final_content = message.content
+        if message.attachments:
+            # 将所有附件的URL附加到内容后面
+            urls = [att.url for att in message.attachments]
+            if final_content: # 如果已有文本内容，则换行
+                final_content += "\n" + "\n".join(urls)
+            else: # 如果没有文本内容，直接就是url
+                final_content = "\n".join(urls)
+
+
+        # --- 数据库操作 ---
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        try:
+            # 使用 INSERT OR REPLACE 逻辑，如果存在同名预设则更新它
+            cur.execute(
+                """
+                INSERT INTO preset_messages (guild_id, name, content, creator_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, name) DO UPDATE SET
+                content = excluded.content,
+                creator_id = excluded.creator_id;
+                """,
+                (interaction.guild.id, name, final_content, interaction.user.id)
+            )
+            con.commit()
+            await interaction.followup.send(f"✅ 预设消息 `{name}` 已成功被新内容覆盖！", ephemeral=True)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ **数据库错误**：无法覆盖预设消息。\n`{e}`", ephemeral=True)
+        finally:
+            con.close()
+
+    @override_preset.autocomplete('name')
+    async def override_preset_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        cur.execute("SELECT name FROM preset_messages WHERE guild_id = ? AND name LIKE ?", (interaction.guild.id, f'%{current}%'))
+        all_presets = [row[0] for row in cur.fetchall()]
+        con.close()
+
+        return [
+            app_commands.Choice(name=preset, value=preset)
+            for preset in all_presets
+        ][:25]
 
     @preset_group.command(name="删除", description="删除一个已有的预设消息")
     @app_commands.describe(name="要删除的预设消息的名称")
@@ -344,18 +556,30 @@ class PresetMessageCog(commands.Cog):
             await interaction.response.send_message(f"❌ **错误**：找不到名为 `{name}` 的预设消息。请检查您的输入。", ephemeral=True)
             return
         
-        # 2. 构造并发送消息
         content = row[0]
-        # 构造提及用户的消息
-        message_to_send = f"{user.mention}\n{content}"
 
-        try:
-            # 在当前频道发送消息，因为没有原始消息可以回复
-            await interaction.channel.send(message_to_send)
-            # 确认交互成功
-            await interaction.response.send_message(f"✅ 已向 {user.display_name} 发送预设消息 `{name}`。", ephemeral=True)
-        except discord.HTTPException as e:
-            await interaction.response.send_message(f"❌ **发送失败**：无法发送消息。\n`{e}`", ephemeral=True)
+        # --- 权限检查 ---
+        user_role_ids_str = os.getenv("PRESET_USER_ROLE_IDS", "")
+        if not user_role_ids_str:
+            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `PRESET_USER_ROLE_IDS`，无法使用此功能。", ephemeral=True)
+            return
+
+        user_role_ids = {int(rid.strip()) for rid in user_role_ids_str.split(',')}
+        user_roles = {role.id for role in interaction.user.roles}
+
+        # 如果用户有权限
+        if user_roles.intersection(user_role_ids):
+            message_to_send = f"{user.mention}\n{content}"
+            try:
+                await interaction.channel.send(message_to_send)
+                await interaction.response.send_message(f"✅ 已向 {user.display_name} 发送预设消息 `{name}`。", ephemeral=True)
+            except discord.HTTPException as e:
+                await interaction.response.send_message(f"❌ **发送失败**：无法发送消息。\n`{e}`", ephemeral=True)
+        # 如果用户没有权限
+        else:
+            # 对于无权限用户，将消息内容作为临时消息发送给他们自己看
+            ephemeral_content = f"🚫 **权限不足，无法公开发送给 {user.mention}**\n\n**以下是仅您可见的消息内容：**\n---\n{content}"
+            await interaction.response.send_message(ephemeral_content, ephemeral=True)
 
     @reply_with_preset_slash.autocomplete('name')
     async def reply_with_preset_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -370,6 +594,34 @@ class PresetMessageCog(commands.Cog):
             app_commands.Choice(name=preset, value=preset)
             for preset in all_presets
         ][:25] # Autocomplete最多只能显示25个选项
+
+    async def search_from_message_context_menu(self, interaction: discord.Interaction, message: discord.Message):
+        """新的右键菜单命令，用于从消息内容中检索并发送预设。"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        
+        if not message.content:
+            await interaction.followup.send("❌ 目标消息没有文本内容可供检索。", ephemeral=True)
+            return
+
+        text_to_search = message.content.lower()
+
+        # 从数据库获取当前服务器的所有预设名称
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        cur.execute("SELECT name FROM preset_messages WHERE guild_id = ?", (interaction.guild.id,))
+        all_presets = [row[0] for row in cur.fetchall()]
+        con.close()
+
+        # 查找名称包含消息内容的预设（模糊搜索）
+        matched_presets = [p for p in all_presets if text_to_search in p.lower()]
+
+        if not matched_presets:
+            await interaction.followup.send("ℹ️ 未能从消息内容中匹配到任何预设消息。", ephemeral=True)
+            return
+        
+        # 创建并发送带有按钮的视图
+        view = FuzzySearchReplyView(matched_presets)
+        await interaction.followup.send("🔍 **检索到以下可能的预设消息：**\n请点击按钮直接发送。", view=view, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
