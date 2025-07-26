@@ -67,10 +67,11 @@ class ForumTools(commands.Cog):
                 guild = forum.guild
 
                 cur.execute("SELECT MAX(thread_id) FROM threads WHERE forum_id = ?", (forum_id,))
-                last_id = cur.fetchone()[0]
+                row = cur.fetchone()
+                last_id = row[0] if row else None
 
                 # 如果数据库中没有该论坛的记录，则跳过增量同步
-                if not last_id:
+                if last_id is None:
                     print(f"[后台任务] 论坛 '{forum.name}' 在数据库中为空，跳过。等待手动全量同步。")
                     continue
 
