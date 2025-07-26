@@ -38,12 +38,16 @@ class ForumTools(commands.Cog):
     async def incremental_sync_task(self):
         """后台增量同步任务，只获取上次同步后产生的新帖子。"""
         await self.bot.wait_until_ready()
+        print("\n" + "="*50)
         print("[后台任务] 开始执行增量同步...")
         
         # 直接从 bot 实例获取监控频道列表
         forum_ids_to_scan = self.bot.allowed_forum_ids
+        print(f"[后台任务] 本次将要扫描的频道ID列表: {list(forum_ids_to_scan)}")
+
         if not forum_ids_to_scan:
             print("[后台任务] 未配置任何监控频道，跳过增量同步。")
+            print("="*50 + "\n")
             return
 
         con = sqlite3.connect(DB_FILE)
@@ -56,9 +60,10 @@ class ForumTools(commands.Cog):
             try:
                 forum = self.bot.get_channel(forum_id) or await self.bot.fetch_channel(forum_id)
                 if not forum or not isinstance(forum, discord.ForumChannel):
-                    print(f"[后台任务] 找不到或无效的论坛频道ID: {forum_id}，跳过。")
+                    print(f"[后台任务] 找不到或无效的论坛频道ID: {forum_id}，从列表跳过。")
                     continue
                 
+                print(f"[后台任务] ==> 正在处理频道: {forum.name} (ID: {forum_id})")
                 guild = forum.guild
 
                 cur.execute("SELECT MAX(thread_id) FROM threads WHERE forum_id = ?", (forum_id,))
@@ -91,14 +96,20 @@ class ForumTools(commands.Cog):
                     total_added += cur.rowcount
 
             except discord.Forbidden:
-                print(f"[后台任务] 权限不足，无法增量同步论坛 (ID: {forum_id})。")
+                print(f"[后台任务] 权限不足，无法增量同步论坛 '{forum.name}' (ID: {forum_id})。")
             except Exception as e:
-                print(f"[后台任务] 增量同步论坛 (ID: {forum_id}) 时出错: {e}")
+                # 确保即使 forum 对象获取失败，我们也能知道是哪个ID出错了
+                forum_name_for_log = f"'{forum.name}' " if 'forum' in locals() and forum else ""
+                print(f"[后台任务] 增量同步论坛 {forum_name_for_log}(ID: {forum_id}) 时出错: {type(e).__name__}: {e}")
         
         con.commit()
         con.close()
+        
         if total_added > 0:
             print(f"[后台任务] 增量同步完成。本次新增了 {total_added} 个帖子。")
+        else:
+            print("[后台任务] 增量同步完成。没有新帖子。")
+        print("="*50 + "\n")
 
     # --- 事件监听器：当新帖子创建时 ---
     @commands.Cog.listener()
