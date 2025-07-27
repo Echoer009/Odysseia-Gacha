@@ -6,6 +6,15 @@ import sqlite3
 import os
 import json
 import re
+from thefuzz import process, fuzz
+import jieba
+
+# --- 新增：中文停用词列表 ---
+# 这些词在搜索中通常意义不大，会被过滤掉
+STOP_WORDS = {
+    '怎么', '的', '是', '啊', '吗', '我', '你', '他', '她', '它', '请问',
+    '大佬们', '大佬', '们', '啥', '意思', '一个', '那个', '这个', '了','什么'
+}
 
 DB_FILE = 'posts.db'
 
@@ -603,25 +612,60 @@ class PresetMessageCog(commands.Cog):
             await interaction.followup.send("❌ 目标消息没有文本内容可供检索。", ephemeral=True)
             return
 
-        text_to_search = message.content.lower()
-
-        # 从数据库获取当前服务器的所有预设名称
+        raw_query = message.content
+        
+        # 从数据库获取所有预设
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
-        cur.execute("SELECT name FROM preset_messages WHERE guild_id = ?", (interaction.guild.id,))
-        all_presets = [row[0] for row in cur.fetchall()]
+        cur.execute("SELECT name, content FROM preset_messages WHERE guild_id = ?", (interaction.guild.id,))
+        all_presets = cur.fetchall() # [(name, content), ...]
         con.close()
 
-        # 查找名称包含消息内容的预设（模糊搜索）
-        matched_presets = [p for p in all_presets if text_to_search in p.lower()]
+        if not all_presets:
+            await interaction.followup.send("ℹ️ 当前服务器还没有任何预设消息。", ephemeral=True)
+            return
 
-        if not matched_presets:
-            await interaction.followup.send("ℹ️ 未能从消息内容中匹配到任何预设消息。", ephemeral=True)
+        # --- 最终版 Pro Max：动态相关性过滤策略 ---
+        
+        # 1. 分词并过滤停用词
+        raw_keywords = jieba.cut_for_search(raw_query)
+        query_keywords = {k.lower() for k in raw_keywords if k not in STOP_WORDS and k.strip()}
+        if not query_keywords:
+            query_keywords = {k.lower() for k in raw_keywords if k.strip()}
+        # 2. 超级加权计分
+        scores = {}
+        for name, content in all_presets:
+            current_score = 0
+            for keyword in query_keywords:
+                if keyword in name.lower():
+                    current_score += 10  # 名称中匹配，权重极高
+                if keyword in content.lower():
+                    current_score += 1   # 内容中匹配，权重较低
+            if current_score > 0:
+                scores[name] = current_score
+
+        # 3. 动态阈值过滤
+        if not scores:
+            final_matches = []
+        else:
+            max_score = max(scores.values())
+            # 及格线设为最高分的40%，但最低不能低于2分
+            score_threshold = max(max_score * 0.4, 2)
+            
+            # 筛选出所有高于及格线的
+            passed_matches = {name: score for name, score in scores.items() if score >= score_threshold}
+            
+            # 按分数排序
+            sorted_matches = sorted(passed_matches.items(), key=lambda item: item[1], reverse=True)
+            final_matches = [name for name, score in sorted_matches]
+
+        if not final_matches:
+            await interaction.followup.send(f"ℹ️ 未能从预设消息的 **名称** 或 **内容** 中找到与 `{message.content}` 高度相关的结果。", ephemeral=True)
             return
         
         # 创建并发送带有按钮的视图
-        view = FuzzySearchReplyView(matched_presets)
-        await interaction.followup.send("🔍 **检索到以下可能的预设消息：**\n请点击按钮直接发送。", view=view, ephemeral=True)
+        view = FuzzySearchReplyView(final_matches[:25]) # 最多显示25个按钮
+        await interaction.followup.send("🔍 **检索到以下高度相关的预设消息：**\n请点击按钮直接发送。", view=view, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
