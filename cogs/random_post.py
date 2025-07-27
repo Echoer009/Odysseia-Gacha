@@ -237,6 +237,21 @@ class RandomPostView(discord.ui.View):
         await interaction.response.send_message("请从下面选择你的专属抽卡范围：", view=view, ephemeral=True)
 
 
+# --- 辅助函数：创建抽卡面板 ---
+async def create_gacha_panel(bot: commands.Bot, channel: discord.TextChannel):
+    """创建并发送抽卡面板到指定频道。"""
+    embed = discord.Embed(
+        title="🎉 类脑抽抽乐 🎉",
+        description="欢迎来到类脑抽卡机！准备好迎接命运的安排了吗？!\n\n"
+                    "**玩法介绍:**\n"
+                    "- **抽一张 ✨**: 试试手气，看看今天的天选之卡是什么！\n"
+                    "- **抽五张 🎇**: 大力出奇迹！一次性抽取五张，总有一张您喜欢！\n"
+                    "- **设置卡池 🔧**: 定制您的专属卡池，只抽你最感兴趣的内容！\n\n",
+        color=discord.Color.gold()
+    )
+    await channel.send(embed=embed, view=RandomPostView(bot))
+
+
 # --- Cog 类 ---
 class RandomPost(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -248,7 +263,7 @@ class RandomPost(commands.Cog):
 
     @app_commands.command(name="建立随机抽取面板", description="发送一个持久化的面板，用于随机抽取帖子。")
     async def random_post_panel(self, interaction: discord.Interaction):
-        """发送随机帖子抽取面板。"""
+        """发送或重建随机帖子抽取面板。"""
         # --- 从 .env 加载配置 ---
         admin_role_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
         if not admin_role_ids_str:
@@ -263,16 +278,21 @@ class RandomPost(commands.Cog):
             await interaction.response.send_message("🚫 **权限不足**：只有拥有特定管理员身份组的用户才能执行此操作。", ephemeral=True)
             return
 
-        embed = discord.Embed(
-            title="🎉 类脑抽抽乐 🎉",
-            description="欢迎来到类脑抽卡机！准备好迎接命运的安排了吗？!\n\n"
-                        "**玩法介绍:**\n"
-                        "- **抽一张 ✨**: 试试手气，看看今天的天选之卡是什么！\n"
-                        "- **抽五张 🎇**: 大力出奇迹！一次性抽取五张，总有一张您喜欢！\n"
-                        "- **设置卡池 🔧**: 定制您的专属卡池，只抽你最感兴趣的内容！\n\n",
-            color=discord.Color.gold()
-        )
-        await interaction.response.send_message(embed=embed, view=RandomPostView(self.bot))
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # 查找并删除此频道中任何现有的抽卡面板
+        async for message in interaction.channel.history(limit=100):
+            if message.author == self.bot.user and message.embeds:
+                if message.embeds[0].title == "🎉 类脑抽抽乐 🎉":
+                    try:
+                        await message.delete()
+                    except discord.HTTPException as e:
+                        print(f"删除旧面板时出错 (可能已被删除): {e}")
+        
+        # 创建新的面板
+        await create_gacha_panel(self.bot, interaction.channel)
+        
+        await interaction.followup.send("✅ 抽卡面板已成功建立在本频道。", ephemeral=True)
 
 # --- Cog 设置函数 ---
 async def setup(bot: commands.Bot):

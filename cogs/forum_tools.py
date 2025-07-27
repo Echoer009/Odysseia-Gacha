@@ -6,7 +6,9 @@ from discord.ext import tasks
 import os
 import sqlite3
 from typing import Optional
+import datetime
 from dotenv import set_key, unset_key
+from .random_post import create_gacha_panel
 
 # --- 数据库文件路径 ---
 DB_FILE = 'posts.db'
@@ -28,9 +30,13 @@ class ForumTools(commands.Cog):
         
         # 动态修改任务的循环间隔并启动
         self.incremental_sync_task.change_interval(hours=sync_hours)
+        
+        # 启动新的清理任务
+        self.cleanup_old_posts_task.start()
 
     def cog_unload(self):
         self.incremental_sync_task.cancel()
+        self.cleanup_old_posts_task.cancel()
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -38,6 +44,9 @@ class ForumTools(commands.Cog):
         if not self.incremental_sync_task.is_running():
             print("[ForumTools] Bot is ready, starting incremental_sync_task.")
             self.incremental_sync_task.start()
+        if not self.cleanup_old_posts_task.is_running():
+            print("[ForumTools] Bot is ready, starting cleanup_old_posts_task.")
+            self.cleanup_old_posts_task.start()
 
     # 移除这里的硬编码时间, 在 __init__ 中动态设置
     @tasks.loop()
@@ -177,12 +186,73 @@ class ForumTools(commands.Cog):
             if thread.applied_tags:
                 tags_str = ", ".join(tag.name for tag in thread.applied_tags)
                 embed.add_field(name="🏷️ 标签", value=tags_str, inline=False)
+            # 发送新卡速递
             await delivery_channel.send(embed=embed)
+
+            # --- 重建抽卡面板 ---
+            # 1. 查找并删除此频道中任何现有的抽卡面板
+            async for message in delivery_channel.history(limit=100):
+                if message.author == self.bot.user and message.embeds:
+                    if message.embeds[0].title == "🎉 类脑抽抽乐 🎉":
+                        try:
+                            await message.delete()
+                        except discord.HTTPException as e:
+                            print(f"删除旧面板时出错 (可能已被删除): {e}")
+            
+            # 2. 创建新的面板
+            await create_gacha_panel(self.bot, delivery_channel)
 
         except discord.errors.Forbidden:
             print(f"错误：机器人没有权限在频道 {delivery_channel.name} 中发送消息。")
         except Exception as e:
             print(f"处理新帖速递时发生未知错误: {e}")
+
+    @tasks.loop(hours=1)
+    async def cleanup_old_posts_task(self):
+        """后台任务，每小时运行一次，清理超过24小时的速递消息。"""
+        await self.bot.wait_until_ready()
+        
+        delivery_channel_id = self.bot.delivery_channel_id
+        if not delivery_channel_id:
+            return # 如果没有设置速递频道，则不执行任何操作
+
+        channel = self.bot.get_channel(delivery_channel_id)
+        if not channel:
+            return
+
+        print(f"[清理任务] 开始检查频道 '{channel.name}' 中的旧帖子...")
+        deleted_count = 0
+        
+        # 计算24小时前的时间点
+        time_limit = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
+
+        try:
+            async for message in channel.history(limit=None, oldest_first=True):
+                # 如果消息比时间限制还早，就处理它
+                if message.created_at < time_limit:
+                    # 只删除带有 "新卡速递" embed 的机器人消息
+                    if message.author == self.bot.user and message.embeds:
+                        if message.embeds[0].title and "新卡速递" in message.embeds[0].title:
+                            try:
+                                await message.delete()
+                                deleted_count += 1
+                            except discord.Forbidden:
+                                print(f"[清理任务] 权限不足，无法删除消息 {message.id}。")
+                                # 如果遇到权限问题，很可能后续也无法删除，直接停止本次任务
+                                break
+                            except discord.HTTPException as e:
+                                print(f"[清理任务] 删除消息 {message.id} 时出错: {e}")
+                else:
+                    # 因为我们从最旧的消息开始，一旦遇到一个在24小时内的消息，
+                    # 就可以确定后面的所有消息都是新的，无需再检查
+                    break
+        except discord.Forbidden:
+            print(f"[清理任务] 权限不足，无法读取频道 '{channel.name}' 的历史记录。")
+        except Exception as e:
+            print(f"[清理任务] 发生未知错误: {e}")
+
+        if deleted_count > 0:
+            print(f"[清理任务] 清理完成，共删除了 {deleted_count} 条旧消息。")
 
     # --- 斜杠命令组：/设置 ---
     # 移除了所有动态配置命令，现在只保留手动同步
