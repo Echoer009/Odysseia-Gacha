@@ -91,8 +91,9 @@ class FuzzySearchReplyView(discord.ui.View):
     """
     一个视图，为模糊搜索到的预设消息提供发送按钮。
     """
-    def __init__(self, matched_presets: list[str], timeout=180):
+    def __init__(self, matched_presets: list[str], *, target_message: discord.Message, timeout=180):
         super().__init__(timeout=timeout)
+        self.target_message = target_message  # 保存目标消息
         # 为每个匹配到的预设创建一个按钮，最多25个
         for preset_name in matched_presets[:25]:
             self.add_item(self.SendPresetButton(label=preset_name))
@@ -131,11 +132,11 @@ class FuzzySearchReplyView(discord.ui.View):
             # --- 根据权限发送或拒绝 ---
             if user_roles.intersection(user_role_ids):
                 try:
-                    await interaction.channel.send(content)
+                    await self.view.target_message.reply(content)
                     # 成功发送后，编辑原消息，禁用所有按钮
                     for item in self.view.children:
                         item.disabled = True
-                    await interaction.edit_original_response(content=f"✅ **已发送预设消息**：`{preset_name}`", view=self.view)
+                    await interaction.edit_original_response(content=f"✅ **已回复预设消息**：`{preset_name}`", view=self.view)
                 except discord.HTTPException as e:
                     await interaction.followup.send(f"❌ **发送失败**：\n`{e}`", ephemeral=True)
             else:
@@ -664,8 +665,8 @@ class PresetMessageCog(commands.Cog):
             return
         
         # 创建并发送带有按钮的视图
-        view = FuzzySearchReplyView(final_matches[:25]) # 最多显示25个按钮
-        await interaction.followup.send("🔍 **检索到以下高度相关的预设消息：**\n请点击按钮直接发送。", view=view, ephemeral=True)
+        view = FuzzySearchReplyView(final_matches[:25], target_message=message) # 最多显示25个按钮
+        await interaction.followup.send("🔍 **检索到以下高度相关的预设消息：**\n请点击按钮直接回复。", view=view, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
