@@ -14,6 +14,7 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 ALLOWED_CHANNEL_IDS_STR = os.getenv("ALLOWED_CHANNEL_IDS", "")
 DELIVERY_CHANNEL_ID_STR = os.getenv("DELIVERY_CHANNEL_ID", "")
+DEFAULT_POOL_EXCLUSION_IDS_STR = os.getenv("DEFAULT_POOL_EXCLUSION_IDS", "")
 
 # --- Bot 设置 ---
 # 创建一个 Bot 实例，并启用所有默认的 Intents
@@ -29,6 +30,7 @@ class MyBot(commands.Bot):
         # --- 统一配置处理 ---
         self.allowed_forum_ids = {int(cid.strip()) for cid in ALLOWED_CHANNEL_IDS_STR.split(',') if cid.strip()}
         self.delivery_channel_id = int(DELIVERY_CHANNEL_ID_STR) if DELIVERY_CHANNEL_ID_STR else None
+        self.default_pool_exclusions = {int(cid.strip()) for cid in DEFAULT_POOL_EXCLUSION_IDS_STR.split(',') if cid.strip()}
 
     async def setup_hook(self):
         """

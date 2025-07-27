@@ -6,6 +6,7 @@ import json
 import os
 import random
 import sqlite3
+import logging
 
 # --- 数据库文件路径 ---
 DB_FILE = 'posts.db'
@@ -13,7 +14,7 @@ DB_FILE = 'posts.db'
 # --- 数据库初始化 ---
 def init_db():
     """初始化数据库并创建表。"""
-    con = sqlite3.connect(DB_FILE)
+    con = sqlite3.connect(DB_FILE, timeout=10)
     cur = con.cursor()
     # 创建帖子表
     cur.execute('''
@@ -35,7 +36,7 @@ def init_db():
     con.close()
 
 # --- 格式化帖子为 Embed 的辅助函数 ---
-async def format_post_embed(thread: discord.Thread, title_prefix: str = "✨ 新卡速递") -> discord.Embed:
+async def format_post_embed(interaction: discord.Interaction, thread: discord.Thread, title_prefix: str = "✨ 新卡速递") -> discord.Embed:
     """将一个帖子对象格式化为类似于新帖速递的嵌入式消息。"""
     try:
         starter_message = thread.starter_message or await thread.fetch_message(thread.id)
@@ -69,7 +70,12 @@ async def format_post_embed(thread: discord.Thread, title_prefix: str = "✨ 新
         embed.set_footer(text=f"来自论坛: {thread.parent.name}")
         return embed
     except Exception as e:
-        print(f"格式化帖子 Embed 时出错: {e}")
+        log_message = (
+            f"Error formatting embed for thread ID {thread.id} ('{thread.name}') "
+            f"in forum '{thread.parent.name if thread.parent else 'N/A'}'. "
+            f"Triggered by {interaction.user} ({interaction.user.id})."
+        )
+        logging.exception(log_message)
         return discord.Embed(title="错误", description=f"无法加载帖子 {thread.name} 的信息。", color=discord.Color.red())
 
 # --- UI 组件：卡池选择视图 ---
@@ -105,12 +111,13 @@ class PoolSelectView(discord.ui.View):
 
     async def pool_select_callback(self, interaction: discord.Interaction):
         """处理卡池选择，并将结果存入数据库。"""
+        await interaction.response.defer() # 立即响应交互，防止超时
         selected_values = interaction.data['values']
         
         # 将选择的列表转换为 JSON 字符串
         pools_json = json.dumps(selected_values)
         
-        con = sqlite3.connect(DB_FILE)
+        con = sqlite3.connect(DB_FILE, timeout=10)
         cur = con.cursor()
         cur.execute(
             "INSERT OR REPLACE INTO user_preferences (user_id, guild_id, selected_pools) VALUES (?, ?, ?)",
@@ -133,7 +140,7 @@ class PoolSelectView(discord.ui.View):
         for item in self.children:
             item.disabled = True
         # 编辑原始消息，显示确认信息并更新视图
-        await interaction.response.edit_message(content=f"您的专属卡池已保存为: **{', '.join(selected_labels)}**,**现在是我的回合,Dolo!**", view=self)
+        await interaction.edit_original_response(content=f"您的专属卡池已保存为: **{', '.join(selected_labels)}**,**现在是我的回合,Dolo!**", view=self)
 
 
 # --- UI 组件：主抽卡面板视图 ---
@@ -148,7 +155,7 @@ class RandomPostView(discord.ui.View):
         guild_id = interaction.guild.id
         con = None  # 初始化 con
         try:
-            con = sqlite3.connect(DB_FILE)
+            con = sqlite3.connect(DB_FILE, timeout=10)
             cur = con.cursor()
 
             # 1. 获取用户偏好
@@ -169,9 +176,14 @@ class RandomPostView(discord.ui.View):
             if not target_forum_ids:
                 # 直接从 bot 实例获取所有监控的论坛ID
                 all_allowed_ids = self.bot.allowed_forum_ids
-                # 筛选出属于当前服务器的频道
+                # 获取要从默认卡池中排除的频道ID
+                exclusions = self.bot.default_pool_exclusions
+                
+                # 筛选出属于当前服务器且未被排除的频道
                 guild_channels = []
                 for channel_id in all_allowed_ids:
+                    if channel_id in exclusions:
+                        continue # 跳过被排除的频道
                     channel = self.bot.get_channel(channel_id)
                     if channel and channel.guild.id == guild_id:
                         guild_channels.append(channel_id)
@@ -202,11 +214,32 @@ class RandomPostView(discord.ui.View):
                     if not isinstance(thread, discord.Thread):
                         not_found_count += 1
                         continue
+                    
+                    # 检查并跳过置顶帖
+                    if thread.flags.pinned:
+                        not_found_count += 1
+                        print(f"跳过置顶帖: {thread.name} ({thread.id})")
+                        continue
+
                     # 移除 "抽卡结果" 字样，直接显示帖子标题
                     title = f"✨ ({i+1-not_found_count}/{draw_count})" if count > 1 else "✨ 你的天选之帖"
-                    embeds.append(await format_post_embed(thread, title_prefix=title))
+                    embed = await format_post_embed(interaction, thread, title_prefix=title)
+                    if embed.title == "错误":
+                        # 帖子无效 (例如，起始消息被删除)
+                        not_found_count += 1
+                        # 从数据库中删除，防止再次抽到
+                        cur.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
+                        con.commit()
+                        print(f"已从数据库中移除无效的帖子 ID: {thread_id}")
+                        continue
+                    embeds.append(embed)
                 except (discord.NotFound, discord.Forbidden):
+                    # 帖子或频道本身找不到了
                     not_found_count += 1
+                    # 同样从数据库中删除
+                    cur.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
+                    con.commit()
+                    print(f"已从数据库中移除无法访问的帖子 ID: {thread_id}")
                     continue
             
             if not embeds:
