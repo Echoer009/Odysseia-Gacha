@@ -7,6 +7,7 @@ import os
 import random
 import sqlite3
 import logging
+import asyncio
 
 # --- 数据库文件路径 ---
 DB_FILE = 'posts.db'
@@ -39,7 +40,21 @@ def init_db():
 async def format_post_embed(interaction: discord.Interaction, thread: discord.Thread, title_prefix: str = "✨ 新卡速递") -> discord.Embed:
     """将一个帖子对象格式化为类似于新帖速递的嵌入式消息。"""
     try:
-        starter_message = thread.starter_message or await thread.fetch_message(thread.id)
+        starter_message = thread.starter_message
+        if not starter_message:
+            max_retries = 3
+            retry_delay = 2  # 秒
+            for attempt in range(max_retries):
+                try:
+                    starter_message = await thread.fetch_message(thread.id)
+                    break  # 获取成功，跳出循环
+                except discord.errors.DiscordServerError as e:
+                    if attempt < max_retries - 1:
+                        print(f"[抽卡模块] 获取帖子 {thread.id} 时遇到服务器503错误，将在 {retry_delay} 秒后重试...")
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        print(f"[抽卡模块] 获取帖子 {thread.id} 失败，已达到最大重试次数。")
+                        raise e  # 重试耗尽，将最终错误抛出，由外层except处理
         
         author_mention = f"**👤 作者:** {thread.owner.name}" if thread.owner else f"**👤 作者:** 未知"
         header_line = f"**{thread.name}** | {author_mention}"
