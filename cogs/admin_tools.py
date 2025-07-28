@@ -54,8 +54,13 @@ class AdminTools(commands.Cog):
             thread_ids = []
             # 从第一行开始，读取第一列 (A列) 的数据
             for row in sheet.iter_rows(min_row=1, values_only=True):
-                if row and row[0] and isinstance(row[0], (int, float)):
-                    thread_ids.append(int(row[0]))
+                if row and row[0]:
+                    try:
+                        # 尝试将单元格内容强制转换为整数，这能兼容文本格式的数字
+                        thread_ids.append(int(row[0]))
+                    except (ValueError, TypeError):
+                        # 如果转换失败（例如，内容是真正的文本），则静默跳过
+                        continue
 
             if not thread_ids:
                 await interaction.followup.send("⚠️ **未找到数据**：在Excel文件的第一列中没有找到任何有效的帖子ID。", ephemeral=True)
