@@ -10,31 +10,41 @@ import os
 @app_commands.context_menu(name="🔝 回到顶部")
 async def back_to_top_context_menu(interaction: discord.Interaction, message: discord.Message):
     """
-    右键菜单命令，仅在用户有发言权限时能成功响应。
+    右键菜单命令，通过 defer 和完整的错误处理确保响应。
     """
-    # 权限检查：Discord API 会在入口处自动处理，如果用户无权，交互会直接失败。
-    # 因此，能执行到这里的，都是有权限的用户。
+    # 立即响应交互，防止超时
+    await interaction.response.defer(ephemeral=True)
     
-    view = discord.ui.View()
     try:
+        view = discord.ui.View()
+        
         if isinstance(interaction.channel, discord.Thread):
             thread = interaction.channel
-            button = discord.ui.Button(label=f"🚀 点击回到《{thread.name}》顶部", style=discord.ButtonStyle.link, url=f"{thread.jump_url}/0")
+            # 帖子可以直接用 jump_url 获取顶部链接
+            first_message_url = thread.jump_url
+            button = discord.ui.Button(label=f"🚀 点击回到《{thread.name}》顶部", style=discord.ButtonStyle.link, url=first_message_url)
             view.add_item(button)
+            
         elif isinstance(interaction.channel, discord.TextChannel):
             channel = interaction.channel
+            # 对于普通频道，我们直接跳转到被右键的消息，因为无法保证能获取到第一条消息
             jump_url = f"https://discord.com/channels/{channel.guild.id}/{channel.id}/0"
             button = discord.ui.Button(label=f"🚀 点击回到 #{channel.name} 的开头", style=discord.ButtonStyle.link, url=jump_url)
             view.add_item(button)
+            
         else:
-            await interaction.response.send_message("❌ 此命令仅支持在服务器的帖子或文本频道中使用。", ephemeral=True)
+            await interaction.followup.send("❌ 此命令仅支持在服务器的帖子或文本频道中使用。", ephemeral=True)
             return
-    except (discord.Forbidden, IndexError):
-        await interaction.response.send_message("❌ 无法获取该频道的起始消息（可能为空或我没有读取历史的权限）。", ephemeral=True)
-        return
+            
+        # 使用 followup 发送最终结果
+        await interaction.followup.send(content="这是您请求的跳转链接：", view=view, ephemeral=True)
 
-    # 对于有权限的用户，发送临时的、仅自己可见的消息
-    await interaction.response.send_message(content="这是您请求的跳转链接：", view=view, ephemeral=True)
+    except Exception as e:
+        # 捕获所有未预料到的错误，并向用户报告
+        print(f"执行 '回到顶部' 命令时发生错误: {e}")
+        # 确保即使出错也有响应
+        if not interaction.response.is_done():
+            await interaction.followup.send("❌ 处理您的请求时发生了一个未知错误，请稍后再试。", ephemeral=True)
 
 
 # 2. 新增一个 Cog 来处理基于表情回应的备用方案
