@@ -138,9 +138,15 @@ class ForumTools(commands.Cog):
         forum_id = thread.parent_id
         print(f"[新帖监听] 检测到新帖子 '{thread.name}' (ID: {thread.id}) 在频道 '{thread.parent.name}' (ID: {forum_id}) 中创建。")
 
-        # 检查此频道是否在 .env 的监控列表中
+        # --- 检查帖子来源是否在监控且未被排除的频道列表中 ---
+        # 1. 必须在总的监控列表里
         if forum_id not in self.bot.allowed_forum_ids:
             print(f"[新帖监听] 忽略：帖子源频道 '{thread.parent.name}' 不在 .env 配置的 ALLOWED_CHANNEL_IDS 监控列表中。")
+            return
+        
+        # 2. 不能在排除列表里
+        if forum_id in self.bot.default_pool_exclusions:
+            print(f"[新帖监听] 忽略：帖子源频道 '{thread.parent.name}' 在 .env 配置的 DEFAULT_POOL_EXCLUSIONS 排除列表中，因此不进行速递。")
             return
 
         # 1. 更新数据库
