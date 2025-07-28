@@ -184,6 +184,9 @@ class ForumTools(commands.Cog):
             for attempt in range(max_retries):
                 try:
                     starter_message = thread.starter_message or await thread.fetch_message(thread.id)
+                    # 如果是在重试后成功的，就打印一条成功日志
+                    if attempt > 0:
+                        print(f"[新帖速递] 信息：在第 {attempt + 1} 次尝试后，成功获取到帖子 '{thread.name}' 的起始消息。")
                     # 如果成功获取，就跳出循环
                     break
                 except discord.NotFound:
