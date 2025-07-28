@@ -48,10 +48,12 @@ class MyBot(commands.Bot):
         print("--- 所有 Cogs 加载完毕 ---")
         
         # --- 自动同步应用程序命令 ---
-        # --- 自动同步应用程序命令到指定的服务器 ---
+        # --- 自动同步应用程序命令 ---
         guild_ids = {int(gid.strip()) for gid in GUILD_IDS_STR.split(',') if gid.strip()} if GUILD_IDS_STR else set()
+
         if guild_ids:
-            print(f"--- 正在向 {len(guild_ids)} 个指定服务器同步命令... ---")
+            print(f"--- 检测到指定服务器，将以【服务器命令】模式运行 ---")
+            # 1. 将所有在代码中定义的命令复制到指定的服务器
             for guild_id in guild_ids:
                 guild = discord.Object(id=guild_id)
                 try:
@@ -61,9 +63,16 @@ class MyBot(commands.Bot):
                     print(f"  - ✅ 服务器 {guild_id} 同步完成。")
                 except Exception as e:
                     print(f"  - ❌ 服务器 {guild_id} 同步失败: {e}")
-            print("--- ✅ 指定服务器命令同步流程结束 ---")
+            
+            # 2. 清空所有全局命令，这是解决指令重复的关键
+            print("--- 正在清空全局命令以防止重复... ---")
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            print("--- ✅ 全局命令已清空。机器人现在只会在指定服务器显示命令。 ---")
+
         else:
-            print("--- 正在进行全局命令同步 (可能需要长达1小时)... ---")
+            # 如果没有在 .env 指定服务器，则作为全局命令运行
+            print("--- 未检测到指定服务器，将以【全局命令】模式运行 (同步可能需要长达1小时)... ---")
             await self.tree.sync()
             print("--- ✅ 全局命令同步完成 ---")
 
