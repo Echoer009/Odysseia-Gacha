@@ -235,8 +235,8 @@ class ForumTools(commands.Cog):
             await delivery_channel.send(embed=embed)
             print(f"[新帖速递] ✅ 成功发送了关于帖子 '{thread.name}' 的速递到频道 '{delivery_channel.name}'。")
 
-        except discord.errors.Forbidden:
-            print(f"[新帖速递] 权限错误：机器人没有权限在频道 '{delivery_channel.name}' 中发送消息。")
+        except discord.errors.Forbidden as e:
+            print(f"[新帖速递] 权限错误：机器人没有权限在频道 '{delivery_channel.name}' 中发送消息。详细错误: {e}")
             return # 无法发送速递，后续操作也无法进行，直接返回
         except Exception as e:
             print(f"[新帖速递] 失败：在发送速递消息时发生未知错误: {e}")
