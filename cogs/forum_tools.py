@@ -135,9 +135,11 @@ class ForumTools(commands.Cog):
         同时处理新帖速递和数据库更新。
         """
         forum_id = thread.parent_id
+        print(f"[新帖监听] 检测到新帖子 '{thread.name}' (ID: {thread.id}) 在频道 '{thread.parent.name}' (ID: {forum_id}) 中创建。")
 
         # 检查此频道是否在 .env 的监控列表中
         if forum_id not in self.bot.allowed_forum_ids:
+            print(f"[新帖监听] 忽略：帖子源频道 '{thread.parent.name}' 不在 .env 配置的 ALLOWED_CHANNEL_IDS 监控列表中。")
             return
 
         # 1. 更新数据库
@@ -166,30 +168,72 @@ class ForumTools(commands.Cog):
                 self._delivery_channel_warning_sent = True
             return
 
+        # --- 步骤 2a: 构造并发送速递消息 ---
         try:
-            # (此处省略了 Embed 创建代码，因为它与原版相同)
-            starter_message = thread.starter_message or await thread.fetch_message(thread.id)
+            starter_message = None
+            # --- 引入重试机制来获取起始消息，以应对 Discord API 的最终一致性延迟 ---
+            max_retries = 2
+            retry_delay = 2 # 秒
+            for attempt in range(max_retries):
+                try:
+                    starter_message = thread.starter_message or await thread.fetch_message(thread.id)
+                    # 如果成功获取，就跳出循环
+                    break
+                except discord.NotFound:
+                    if attempt < max_retries - 1:
+                        print(f"[新帖速递] 注意：尝试第 {attempt + 1} 次获取帖子 '{thread.name}' 的起始消息失败 (NotFound)。将在 {retry_delay} 秒后重试...")
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        # 这是最后一次尝试，仍然失败
+                        print(f"[新帖速递] 失败：在 {max_retries} 次尝试后，仍无法获取帖子 '{thread.name}' 的起始消息 (NotFound)。已跳过本次速递。")
+                        return
+                except discord.Forbidden as e:
+                    # 如果是权限问题，重试没有意义，直接放弃
+                    print(f"[新帖速递] 失败：无法获取帖子 '{thread.name}' 的起始消息，因为机器人权限不足。已跳过本次速递。原因: {e}")
+                    return
+                except Exception as e:
+                    # 捕获其他可能的未知错误
+                    print(f"[新帖速递] 失败：获取帖子 '{thread.name}' 的起始消息时发生未知错误。已跳过本次速递。原因: {e}")
+                    return
+
             author_mention = f"**👤 作者:** {thread.owner.name}" if thread.owner else f"**👤 作者:** 未知"
             header_line = f"**{thread.name}** | {author_mention}"
-            post_content = starter_message.content
-            if len(post_content) > 400:
-                post_content = post_content[:400] + "..."
-            content_section = f"**📝 内容速览:**\n{post_content}"
+
+            if starter_message:
+                post_content = starter_message.content
+                if len(post_content) > 400:
+                    post_content = post_content[:400] + "..."
+                content_section = f"**📝 内容速览:**\n{post_content}"
+            else:
+                content_section = "**📝 内容速览:**\n*(无法加载起始消息，可能已被删除或帖子格式特殊)*"
+            
             full_description = f"{header_line}\n\n{content_section}"
             embed = discord.Embed(title="✨ 新卡速递", description=full_description, color=discord.Color.blue())
             embed.add_field(name="🚪 传送门", value=f"[点击查看原帖]({thread.jump_url})", inline=False)
-            if starter_message.attachments:
+
+            # 只有在 starter_message 存在时，才检查附件
+            if starter_message and starter_message.attachments:
                 for attachment in starter_message.attachments:
                     if attachment.content_type and attachment.content_type.startswith('image/'):
                         embed.set_thumbnail(url=attachment.url)
                         break
+            
             if thread.applied_tags:
                 tags_str = ", ".join(tag.name for tag in thread.applied_tags)
                 embed.add_field(name="🏷️ 标签", value=tags_str, inline=False)
-            # 发送新卡速递
+            
             await delivery_channel.send(embed=embed)
+            print(f"[新帖速递] ✅ 成功发送了关于帖子 '{thread.name}' 的速递到频道 '{delivery_channel.name}'。")
 
-            # --- 重建抽卡面板 ---
+        except discord.errors.Forbidden:
+            print(f"[新帖速递] 权限错误：机器人没有权限在频道 '{delivery_channel.name}' 中发送消息。")
+            return # 无法发送速递，后续操作也无法进行，直接返回
+        except Exception as e:
+            print(f"[新帖速递] 失败：在发送速递消息时发生未知错误: {e}")
+            return # 发送速递失败，后续操作也无法进行，直接返回
+
+        # --- 步骤 2b: 重建抽卡面板 ---
+        try:
             # 1. 查找并删除此频道中任何现有的抽卡面板
             async for message in delivery_channel.history(limit=100):
                 if message.author == self.bot.user and message.embeds:
@@ -197,15 +241,13 @@ class ForumTools(commands.Cog):
                         try:
                             await message.delete()
                         except discord.HTTPException as e:
-                            print(f"删除旧面板时出错 (可能已被删除): {e}")
+                            # 这个错误通常是 404 Not Found，意味着面板已被删除，可以安全地忽略
+                            print(f"[面板管理] 删除旧面板时出现小问题 (可忽略): {e}")
             
             # 2. 创建新的面板
             await create_gacha_panel(self.bot, delivery_channel)
-
-        except discord.errors.Forbidden:
-            print(f"错误：机器人没有权限在频道 {delivery_channel.name} 中发送消息。")
         except Exception as e:
-            print(f"处理新帖速递时发生未知错误: {e}")
+            print(f"[面板管理] 严重错误：重建抽卡面板时失败: {e}")
 
     @tasks.loop(hours=1)
     async def cleanup_old_posts_task(self):
@@ -220,7 +262,7 @@ class ForumTools(commands.Cog):
         if not channel:
             return
 
-        print(f"[清理任务] 开始检查频道 '{channel.name}' 中的旧帖子...")
+        # print(f"[清理任务] 开始检查频道 '{channel.name}' 中的旧帖子...") # 注释掉，以减少不必要的日志
         deleted_count = 0
         
         # 计算24小时前的时间点
@@ -252,7 +294,7 @@ class ForumTools(commands.Cog):
             print(f"[清理任务] 发生未知错误: {e}")
 
         if deleted_count > 0:
-            print(f"[清理任务] 清理完成，共删除了 {deleted_count} 条旧消息。")
+            print(f"[清理任务] 清理完成，在频道 '{channel.name}' 中成功删除了 {deleted_count} 条超过24小时的旧速递。")
 
     # --- 斜杠命令组：/设置 ---
     # 移除了所有动态配置命令，现在只保留手动同步

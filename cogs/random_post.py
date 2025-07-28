@@ -230,16 +230,21 @@ class RandomPostView(discord.ui.View):
                         # 从数据库中删除，防止再次抽到
                         cur.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
                         con.commit()
-                        print(f"已从数据库中移除无效的帖子 ID: {thread_id}")
+                        print(f"[抽卡模块] 清理数据库: 移除了一个帖子 (ID: {thread_id})，原因: 帖子内容(起始消息)无法加载。")
                         continue
                     embeds.append(embed)
-                except (discord.NotFound, discord.Forbidden):
+                except (discord.NotFound, discord.Forbidden) as e:
                     # 帖子或频道本身找不到了
                     not_found_count += 1
                     # 同样从数据库中删除
                     cur.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
                     con.commit()
-                    print(f"已从数据库中移除无法访问的帖子 ID: {thread_id}")
+                    # 添加更详细的日志
+                    reason = "帖子本身已被删除" if isinstance(e, discord.NotFound) else "机器人无权访问该帖子"
+                    print(
+                        f"[抽卡模块] 清理数据库: 用户 {interaction.user} (ID: {interaction.user.id}) "
+                        f"抽中了无法访问的帖子 (ID: {thread_id})，已自动移除。原因: {reason}"
+                    )
                     continue
             
             if not embeds:

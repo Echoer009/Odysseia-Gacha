@@ -11,7 +11,7 @@ import json
 # 加载 .env 文件中的环境变量
 load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")
+GUILD_IDS_STR = os.getenv("GUILD_IDS")
 ALLOWED_CHANNEL_IDS_STR = os.getenv("ALLOWED_CHANNEL_IDS", "")
 DELIVERY_CHANNEL_ID_STR = os.getenv("DELIVERY_CHANNEL_ID", "")
 DEFAULT_POOL_EXCLUSION_IDS_STR = os.getenv("DEFAULT_POOL_EXCLUSION_IDS", "")
@@ -48,12 +48,20 @@ class MyBot(commands.Bot):
         print("--- 所有 Cogs 加载完毕 ---")
         
         # --- 自动同步应用程序命令 ---
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            print(f"--- 正在向测试服务器 (ID: {GUILD_ID}) 同步命令... ---")
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            print("--- ✅ 测试服务器命令同步完成 ---")
+        # --- 自动同步应用程序命令到指定的服务器 ---
+        guild_ids = {int(gid.strip()) for gid in GUILD_IDS_STR.split(',') if gid.strip()} if GUILD_IDS_STR else set()
+        if guild_ids:
+            print(f"--- 正在向 {len(guild_ids)} 个指定服务器同步命令... ---")
+            for guild_id in guild_ids:
+                guild = discord.Object(id=guild_id)
+                try:
+                    print(f"  - 正在同步到服务器 ID: {guild_id}...")
+                    self.tree.copy_global_to(guild=guild)
+                    await self.tree.sync(guild=guild)
+                    print(f"  - ✅ 服务器 {guild_id} 同步完成。")
+                except Exception as e:
+                    print(f"  - ❌ 服务器 {guild_id} 同步失败: {e}")
+            print("--- ✅ 指定服务器命令同步流程结束 ---")
         else:
             print("--- 正在进行全局命令同步 (可能需要长达1小时)... ---")
             await self.tree.sync()
@@ -95,14 +103,19 @@ class MyBot(commands.Bot):
 
         # --- 打印已注册的命令 ---
         print("--- 正在获取已注册的命令列表 ---")
-        guild_id = os.getenv("GUILD_ID")
+        guild_ids_str = os.getenv("GUILD_IDS")
         cmd_list = []
         location = "全局"
-        if guild_id:
-            guild = discord.Object(id=int(guild_id))
+        
+        # 检查是否有指定的服务器ID
+        if guild_ids_str:
+            # 只选择第一个服务器作为代表来获取命令列表，避免启动时多次请求
+            first_guild_id = int(guild_ids_str.split(',')[0].strip())
+            guild = discord.Object(id=first_guild_id)
             cmd_list = await self.tree.fetch_commands(guild=guild)
-            location = f"测试服务器 (ID: {guild_id})"
+            location = f"指定的服务器 (以 {first_guild_id} 为代表)"
         else:
+            # 如果没有指定服务器，则获取全局命令
             cmd_list = await self.tree.fetch_commands()
 
         print(f"--- ✅ 在 [{location}] 共找到 {len(cmd_list)} 条命令 ---")
@@ -132,7 +145,7 @@ async def sync(
         !sync ~       -> 同步当前服务器的命令
         !sync *       -> 将全局命令复制到当前服务器并同步
         !sync ^       -> 清除当前服务器的所有命令并同步
-        !sync 123 456 -> 同步到指定的服务器ID
+        !sync 123 456 ... -> 同步到指定的一个或多个服务器ID
     """
     if not guilds:
         if spec == "~":
@@ -152,16 +165,34 @@ async def sync(
         )
         return
 
-    ret = 0
+    # --- 处理多个服务器ID的同步 ---
+    succeeded = []
+    failed = []
     for guild in guilds:
         try:
+            # 尝试同步命令到指定的服务器
             await ctx.bot.tree.sync(guild=guild)
-        except discord.HTTPException:
-            pass
-        else:
-            ret += 1
+            succeeded.append(str(guild.id))
+        except discord.HTTPException as e:
+            # 如果同步失败 (例如, 机器人不在该服务器), 记录下来
+            failed.append(f"{guild.id} (HTTP错误: {e.code})")
+        except Exception as e:
+            # 捕获其他可能的未知错误
+            failed.append(f"{guild.id} (未知错误: {type(e).__name__})")
 
-    await ctx.send(f"已同步到 {ret}/{len(guilds)} 个服务器。")
+    # --- 构造清晰的反馈消息 ---
+    message_parts = []
+    if succeeded:
+        message_parts.append(f"✅ 成功同步到 {len(succeeded)} 个服务器: `{', '.join(succeeded)}`")
+    if failed:
+        message_parts.append(f"❌ 在 {len(failed)} 个服务器上同步失败: `{', '.join(failed)}`")
+
+    # 如果 guilds 列表不为空但没有任何操作成功或失败 (理论上不太可能)
+    if not message_parts and guilds:
+        await ctx.send("处理了指定的服务器，但没有发生任何变化。")
+        return
+
+    await ctx.send("\n".join(message_parts))
 
 
 # --- 运行 Bot ---
