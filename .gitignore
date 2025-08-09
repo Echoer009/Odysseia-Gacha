@@ -5,6 +5,10 @@
 # --- Database & Config Files ---
 # Ignore the SQLite database file.
 posts.db
+posts.db-journal
+
+# Ignore the backups directory.
+backups/
 # Ignore the server-specific configuration file.
 config.json
 

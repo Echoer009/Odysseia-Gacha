@@ -26,7 +26,7 @@ intents.members = True
 
 class MyBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="odysseia!", intents=intents)
         # --- 统一配置处理 ---
         self.allowed_forum_ids = {int(cid.strip()) for cid in ALLOWED_CHANNEL_IDS_STR.split(',') if cid.strip()}
         self.delivery_channel_id = int(DELIVERY_CHANNEL_ID_STR) if DELIVERY_CHANNEL_ID_STR else None
