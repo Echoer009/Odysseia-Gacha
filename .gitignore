@@ -18,9 +18,11 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.venv/
 
 # --- IDE & OS specific ---
 # Ignore VSCode settings
 .vscode/
+
 # Ignore macOS specific files
 .DS_Store
