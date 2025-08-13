@@ -73,6 +73,8 @@ class PresetReplySelect(discord.ui.Select):
         if user_roles.intersection(user_role_ids):
             try:
                 await self.target_message.reply(content)
+                # 私聊同步发送
+                await self.target_message.author.send(content)
                 await interaction.response.edit_message(content="✅ **回复已发送！**", view=None)
             except discord.HTTPException as e:
                 await interaction.response.edit_message(content=f"❌ **回复失败**：无法发送消息。\n`{e}`", view=None)
@@ -133,6 +135,8 @@ class FuzzySearchReplyView(discord.ui.View):
             if user_roles.intersection(user_role_ids):
                 try:
                     await self.view.target_message.reply(content)
+                    # 私聊同步发送
+                    await self.view.target_message.author.send(content)
                     # 成功发送后，编辑原消息，禁用所有按钮
                     for item in self.view.children:
                         item.disabled = True
@@ -582,6 +586,8 @@ class PresetMessageCog(commands.Cog):
             message_to_send = f"{user.mention}\n{content}"
             try:
                 await interaction.channel.send(message_to_send)
+                # 私聊同步发送
+                await user.send(message_to_send)
                 await interaction.response.send_message(f"✅ 已向 {user.display_name} 发送预设消息 `{name}`。", ephemeral=True)
             except discord.HTTPException as e:
                 await interaction.response.send_message(f"❌ **发送失败**：无法发送消息。\n`{e}`", ephemeral=True)
