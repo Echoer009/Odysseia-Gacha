@@ -74,7 +74,7 @@ class PresetReplySelect(discord.ui.Select):
             try:
                 await self.target_message.reply(content)
                 # 确认是否私聊发送
-                await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.target_message.author))
+                await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.target_message.author), ephemeral=True)
                 await interaction.response.edit_message(content="✅ **回复已发送！**", view=None)
             except discord.HTTPException as e:
                 await interaction.response.edit_message(content=f"❌ **回复失败**：无法发送消息。\n`{e}`", view=None)
@@ -136,7 +136,7 @@ class FuzzySearchReplyView(discord.ui.View):
                 try:
                     await self.view.target_message.reply(content)
                     # 确认是否私聊发送
-                    await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.view.target_message.author))
+                    await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.view.target_message.author), ephemeral=True)
                     # 成功发送后，编辑原消息，禁用所有按钮
                     for item in self.view.children:
                         item.disabled = True
