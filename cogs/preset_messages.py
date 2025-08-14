@@ -75,7 +75,7 @@ class PresetReplySelect(discord.ui.Select):
                 await self.target_message.reply(content)
                 # 确认是否私聊发送
                 await interaction.response.edit_message(content="✅ **回复已发送！**", view=None)
-                await interaction.response.send_message(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.target_message.author), ephemeral=True)
+                await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.target_message.author), ephemeral=True)
             except discord.HTTPException as e:
                 await interaction.response.edit_message(content=f"❌ **回复失败**：无法发送消息。\n`{e}`", view=None)
         # 如果用户没有权限
