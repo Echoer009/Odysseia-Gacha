@@ -74,8 +74,8 @@ class PresetReplySelect(discord.ui.Select):
             try:
                 await self.target_message.reply(content)
                 # 确认是否私聊发送
-                await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.target_message.author), ephemeral=True)
                 await interaction.response.edit_message(content="✅ **回复已发送！**", view=None)
+                await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.target_message.author), ephemeral=True)
             except discord.HTTPException as e:
                 await interaction.response.edit_message(content=f"❌ **回复失败**：无法发送消息。\n`{e}`", view=None)
         # 如果用户没有权限
@@ -153,22 +153,17 @@ class FuzzySearchReplyView(discord.ui.View):
 class PrivateFollowUpView(discord.ui.View):
     def __init__(self, content: str, *, target_user: discord.Member, timeout=180):
         super().__init__(timeout=timeout)
+        self.content = content
         self.target_user = target_user
-        self.add_item(discord.ui.Button(label="私聊发送", style=discord.ButtonStyle.primary, custom_id="private_follow_up"))
-        self.add_item(discord.ui.Button(label="取消", style=discord.ButtonStyle.secondary, custom_id="cancel_follow_up"))
-    
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.data['custom_id'] == "private_follow_up":
-            await self.target_user.send(self.content)
-            # 禁用所有按钮
-            for item in self.children:
-                item.disabled = True
-            await interaction.edit_original_response(view=self, content="✅ 已私聊发送预设消息。")
-        elif interaction.data['custom_id'] == "cancel_follow_up":
-            # 禁用所有按钮
-            for item in self.children:
-                item.disabled = True
-            await interaction.edit_original_response(view=self, content="❌ 已取消私聊发送。")
+
+    @discord.ui.button(label="私聊发送", style=discord.ButtonStyle.primary, custom_id="private_follow_up")
+    async def private_follow_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.target_user.send(self.content)
+        await interaction.response.edit_message(view=None, content="✅ 已私聊发送预设消息。")
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary, custom_id="cancel_follow_up")
+    async def cancel_follow_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(view=None, content="❌ 已取消私聊发送。")
 
 # --- 新增：用于搜索的模态框 ---
 class PresetSearchModal(discord.ui.Modal, title="搜索预设消息"):
