@@ -13,7 +13,7 @@ import time
 # --- 新增：全局冷却时间 ---
 # 用于存储最后一次使用命令的时间
 LAST_USED_TIME = 0
-COOLDOWN_DURATION = 10  # 冷却时间（秒）
+COOLDOWN_DURATION = 15  # 冷却时间（秒）
 
 def is_on_cooldown() -> bool:
     """检查是否在全局冷却期内"""
@@ -63,6 +63,12 @@ class PresetReplySelect(discord.ui.Select):
         super().__init__(placeholder="请选择一个预设消息进行回复...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
+        # --- 冷却检查 ---
+        if is_on_cooldown():
+            remaining_time = int(COOLDOWN_DURATION - (time.time() - LAST_USED_TIME))
+            await interaction.response.edit_message(content=f"⏳ **命令冷却中**：请等待 {remaining_time} 秒后再试。", view=None)
+            return
+        
         preset_name = self.values[0]
         
         con = sqlite3.connect(DB_FILE)
@@ -91,6 +97,7 @@ class PresetReplySelect(discord.ui.Select):
         if user_roles.intersection(user_role_ids):
             try:
                 await self.target_message.reply(content)
+                update_cooldown() # 在成功发送后更新冷却时间
                 # 确认是否私聊发送
                 await interaction.response.edit_message(content="✅ **回复已发送！**", view=None)
                 await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.target_message.author), ephemeral=True)
@@ -125,6 +132,17 @@ class FuzzySearchReplyView(discord.ui.View):
 
         async def callback(self, interaction: discord.Interaction):
             await interaction.response.defer() # 先确认交互，防止超时
+
+            # --- 冷却检查 ---
+            if is_on_cooldown():
+                remaining_time = int(COOLDOWN_DURATION - (time.time() - LAST_USED_TIME))
+                await interaction.followup.send(f"⏳ **命令冷却中**：请等待 {remaining_time} 秒后再试。", ephemeral=True)
+                # 禁用所有按钮并提示
+                for item in self.view.children:
+                    item.disabled = True
+                await interaction.edit_original_response(content="⏳ **操作过快，请稍后再试。**", view=self.view)
+                return
+
             preset_name = self.label
 
             # --- 权限检查 ---
@@ -153,6 +171,7 @@ class FuzzySearchReplyView(discord.ui.View):
             if user_roles.intersection(user_role_ids):
                 try:
                     await self.view.target_message.reply(content)
+                    update_cooldown() # 在成功发送后更新冷却时间
                     # 确认是否私聊发送
                     await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.view.target_message.author), ephemeral=True)
                     # 成功发送后，编辑原消息，禁用所有按钮
@@ -569,15 +588,6 @@ class PresetMessageCog(commands.Cog):
 
     async def reply_with_preset_context_menu(self, interaction: discord.Interaction, message: discord.Message):
         """右键菜单命令的回调函数，现在弹出搜索模态框。"""
-        # 检查是否在全局冷却期内
-        if is_on_cooldown():
-            remaining_time = int(COOLDOWN_DURATION - (time.time() - LAST_USED_TIME))
-            await interaction.response.send_message(f"⏳ **命令冷却中**：请等待 {remaining_time} 秒后再试。", ephemeral=True)
-            return
-        
-        # 更新全局冷却时间
-        update_cooldown()
-        
         # 检查服务器是否有任何预设消息
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
@@ -666,15 +676,6 @@ class PresetMessageCog(commands.Cog):
 
     async def search_from_message_context_menu(self, interaction: discord.Interaction, message: discord.Message):
         """新的右键菜单命令，用于从消息内容中检索并发送预设。"""
-        # 检查是否在全局冷却期内
-        if is_on_cooldown():
-            remaining_time = int(COOLDOWN_DURATION - (time.time() - LAST_USED_TIME))
-            await interaction.response.send_message(f"⏳ **命令冷却中**：请等待 {remaining_time} 秒后再试。", ephemeral=True)
-            return
-        
-        # 更新全局冷却时间
-        update_cooldown()
-        
         await interaction.response.defer(ephemeral=True, thinking=True)
         
         if not message.content:
