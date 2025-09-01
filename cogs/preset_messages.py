@@ -8,6 +8,24 @@ import json
 import re
 from thefuzz import process, fuzz
 import jieba
+import time
+
+# --- 新增：全局冷却时间 ---
+# 用于存储最后一次使用命令的时间
+LAST_USED_TIME = 0
+COOLDOWN_DURATION = 10  # 冷却时间（秒）
+
+def is_on_cooldown() -> bool:
+    """检查是否在全局冷却期内"""
+    global LAST_USED_TIME
+    if time.time() - LAST_USED_TIME < COOLDOWN_DURATION:
+        return True
+    return False
+
+def update_cooldown():
+    """更新全局冷却时间"""
+    global LAST_USED_TIME
+    LAST_USED_TIME = time.time()
 
 # --- 新增：中文停用词列表 ---
 # 这些词在搜索中通常意义不大，会被过滤掉
@@ -551,6 +569,15 @@ class PresetMessageCog(commands.Cog):
 
     async def reply_with_preset_context_menu(self, interaction: discord.Interaction, message: discord.Message):
         """右键菜单命令的回调函数，现在弹出搜索模态框。"""
+        # 检查是否在全局冷却期内
+        if is_on_cooldown():
+            remaining_time = int(COOLDOWN_DURATION - (time.time() - LAST_USED_TIME))
+            await interaction.response.send_message(f"⏳ **命令冷却中**：请等待 {remaining_time} 秒后再试。", ephemeral=True)
+            return
+        
+        # 更新全局冷却时间
+        update_cooldown()
+        
         # 检查服务器是否有任何预设消息
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
@@ -575,6 +602,15 @@ class PresetMessageCog(commands.Cog):
     )
     async def reply_with_preset_slash(self, interaction: discord.Interaction, user: discord.Member, name: str, send_to_user: bool = False):
         """通过@用户并发送预设消息，模拟回复效果。"""
+        # 检查是否在全局冷却期内
+        if is_on_cooldown():
+            remaining_time = int(COOLDOWN_DURATION - (time.time() - LAST_USED_TIME))
+            await interaction.response.send_message(f"⏳ **命令冷却中**：请等待 {remaining_time} 秒后再试。", ephemeral=True)
+            return
+        
+        # 更新全局冷却时间
+        update_cooldown()
+        
         # 1. 从数据库获取预设内容
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
@@ -630,6 +666,15 @@ class PresetMessageCog(commands.Cog):
 
     async def search_from_message_context_menu(self, interaction: discord.Interaction, message: discord.Message):
         """新的右键菜单命令，用于从消息内容中检索并发送预设。"""
+        # 检查是否在全局冷却期内
+        if is_on_cooldown():
+            remaining_time = int(COOLDOWN_DURATION - (time.time() - LAST_USED_TIME))
+            await interaction.response.send_message(f"⏳ **命令冷却中**：请等待 {remaining_time} 秒后再试。", ephemeral=True)
+            return
+        
+        # 更新全局冷却时间
+        update_cooldown()
+        
         await interaction.response.defer(ephemeral=True, thinking=True)
         
         if not message.content:
