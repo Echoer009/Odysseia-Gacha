@@ -96,7 +96,7 @@ class PresetReplySelect(discord.ui.Select):
         # 如果用户有权限
         if user_roles.intersection(user_role_ids):
             try:
-                await self.target_message.reply(content)
+                await self.target_message.reply(f"{content}\n\n——由 {interaction.user.display_name} 发送")
                 update_cooldown() # 在成功发送后更新冷却时间
                 # 确认是否私聊发送
                 await interaction.response.edit_message(content="✅ **回复已发送！**", view=None)
@@ -170,7 +170,7 @@ class FuzzySearchReplyView(discord.ui.View):
             # --- 根据权限发送或拒绝 ---
             if user_roles.intersection(user_role_ids):
                 try:
-                    await self.view.target_message.reply(content)
+                    await self.view.target_message.reply(f"{content}\n\n——由 {interaction.user.display_name} 发送")
                     update_cooldown() # 在成功发送后更新冷却时间
                     # 确认是否私聊发送
                     await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.view.target_message.author), ephemeral=True)
@@ -195,7 +195,7 @@ class PrivateFollowUpView(discord.ui.View):
 
     @discord.ui.button(label="私聊发送", style=discord.ButtonStyle.primary, custom_id="private_follow_up")
     async def private_follow_up(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.target_user.send(self.content)
+        await self.target_user.send(f"{self.content}\n\n——由 {interaction.user.display_name} 发送")
         await interaction.response.edit_message(view=None, content="✅ 已私聊发送预设消息。")
 
     @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary, custom_id="cancel_follow_up")
@@ -645,7 +645,7 @@ class PresetMessageCog(commands.Cog):
 
         # 如果用户有权限
         if user_roles.intersection(user_role_ids):
-            message_to_send = f"{user.mention}\n{content}"
+            message_to_send = f"{user.mention}\n{content}\n\n——由 {interaction.user.display_name} 发送"
             try:
                 await interaction.channel.send(message_to_send)
                 # 私聊同步发送
