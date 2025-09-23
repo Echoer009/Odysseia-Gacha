@@ -158,6 +158,25 @@ class PoolSelectView(discord.ui.View):
         await interaction.edit_original_response(content=f"您的专属卡池已保存为: **{', '.join(selected_labels)}**,**现在是我的回合,Dolo!**", view=self)
 
 
+# --- UI 组件：抽卡结果视图 (用于“再来一次”) ---
+class RedrawView(discord.ui.View):
+    def __init__(self, random_post_view_instance, count: int):
+        super().__init__(timeout=300)  # 5分钟超时
+        self.main_view = random_post_view_instance
+
+        if count == 1:
+            button = discord.ui.Button(label="再抽一发", style=discord.ButtonStyle.primary, emoji="✨")
+            async def callback(interaction: discord.Interaction):
+                await self.main_view._draw_posts(interaction, 1)
+            button.callback = callback
+            self.add_item(button)
+        elif count == 5:
+            button = discord.ui.Button(label="再抽五发", style=discord.ButtonStyle.success, emoji="🎇")
+            async def callback(interaction: discord.Interaction):
+                await self.main_view._draw_posts(interaction, 5)
+            button.callback = callback
+            self.add_item(button)
+
 # --- UI 组件：主抽卡面板视图 ---
 class RandomPostView(discord.ui.View):
     def __init__(self, bot: commands.Bot):
@@ -266,7 +285,9 @@ class RandomPostView(discord.ui.View):
                 await interaction.followup.send("👻 很抱歉，抽中的帖子似乎都已消失在时空中...", ephemeral=True)
                 return
 
-            await interaction.followup.send(embeds=embeds, ephemeral=True)
+            # 使用新的、功能完备的 RedrawView
+            redraw_view = RedrawView(self, count)
+            await interaction.followup.send(embeds=embeds, view=redraw_view, ephemeral=True)
 
         except Exception as e:
             print(f"抽卡时发生意外错误: {e}")
