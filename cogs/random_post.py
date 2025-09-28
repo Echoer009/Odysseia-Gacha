@@ -184,117 +184,123 @@ class RandomPostView(discord.ui.View):
         self.bot = bot
 
     async def _draw_posts(self, interaction: discord.Interaction, count: int):
-        """核心抽卡逻辑（数据库版）。"""
+        """核心抽卡逻辑（数据库版），数据库操作已异步化。"""
         await interaction.response.defer(ephemeral=True, thinking=True)
-        guild_id = interaction.guild.id
-        con = None  # 初始化 con
-        try:
-            con = sqlite3.connect(DB_FILE, timeout=10)
-            cur = con.cursor()
 
-            # 1. 获取用户偏好
-            cur.execute("SELECT selected_pools FROM user_preferences WHERE user_id = ? AND guild_id = ?", (interaction.user.id, guild_id))
-            user_pref_row = cur.fetchone()
-            
-            target_forum_ids = []
-            if user_pref_row:
-                try:
-                    user_pools = json.loads(user_pref_row[0])
-                    if "all" not in user_pools:
-                        target_forum_ids = [int(p) for p in user_pools]
-                except (json.JSONDecodeError, TypeError):
-                    await interaction.followup.send("⚠️ 你的卡池设置似乎已损坏，请使用 `设置卡池` 功能重新设置。", ephemeral=True)
-                    return # 直接返回，中断抽卡
+        # 自定义异常，用于在同步函数中传递错误信息
+        class DrawError(Exception):
+            def __init__(self, message):
+                self.message = message
+                super().__init__(self.message)
 
-            # 如果没有偏好或偏好是 "all"，则获取服务器所有监控的论坛
-            if not target_forum_ids:
-                # 直接从 bot 实例获取所有监控的论坛ID
-                all_allowed_ids = self.bot.allowed_forum_ids
-                # 获取要从默认卡池中排除的频道ID
-                exclusions = self.bot.default_pool_exclusions
+        def _fetch_ids_from_db():
+            """在同步函数中执行所有阻塞的数据库操作。"""
+            guild_id = interaction.guild.id
+            con = None
+            try:
+                con = sqlite3.connect(DB_FILE, timeout=10)
+                cur = con.cursor()
+
+                # 1. 获取用户偏好
+                cur.execute("SELECT selected_pools FROM user_preferences WHERE user_id = ? AND guild_id = ?", (interaction.user.id, guild_id))
+                user_pref_row = cur.fetchone()
                 
-                # 筛选出属于当前服务器且未被排除的频道
-                guild_channels = []
-                for channel_id in all_allowed_ids:
-                    if channel_id in exclusions:
-                        continue # 跳过被排除的频道
-                    channel = self.bot.get_channel(channel_id)
-                    if channel and channel.guild.id == guild_id:
-                        guild_channels.append(channel_id)
-                target_forum_ids = guild_channels
+                target_forum_ids = []
+                if user_pref_row:
+                    try:
+                        user_pools = json.loads(user_pref_row[0])
+                        if "all" not in user_pools:
+                            target_forum_ids = [int(p) for p in user_pools]
+                    except (json.JSONDecodeError, TypeError):
+                        raise DrawError("⚠️ 你的卡池设置似乎已损坏，请使用 `设置卡池` 功能重新设置。")
 
-            if not target_forum_ids:
-                await interaction.followup.send("🤔 无法抽卡：管理员尚未配置任何监控论坛，或者您选择的卡池为空。", ephemeral=True)
-                return
+                if not target_forum_ids:
+                    all_allowed_ids = self.bot.allowed_forum_ids
+                    exclusions = self.bot.default_pool_exclusions
+                    guild_channels = []
+                    for channel_id in all_allowed_ids:
+                        if channel_id in exclusions:
+                            continue
+                        channel = self.bot.get_channel(channel_id)
+                        if channel and channel.guild.id == guild_id:
+                            guild_channels.append(channel_id)
+                    target_forum_ids = guild_channels
 
-            # 2. 从数据库中根据偏好抽取帖子ID
-            placeholders = ','.join('?' for _ in target_forum_ids)
-            cur.execute(f"SELECT thread_id FROM threads WHERE guild_id = ? AND forum_id IN ({placeholders})", [guild_id] + target_forum_ids)
-            all_thread_ids = [row[0] for row in cur.fetchall()]
+                if not target_forum_ids:
+                    raise DrawError("🤔 无法抽卡：管理员尚未配置任何监控论坛，或者您选择的卡池为空。")
+
+                # 2. 从数据库中根据偏好抽取帖子ID
+                placeholders = ','.join('?' for _ in target_forum_ids)
+                cur.execute(f"SELECT thread_id FROM threads WHERE guild_id = ? AND forum_id IN ({placeholders})", [guild_id] + target_forum_ids)
+                all_thread_ids = [row[0] for row in cur.fetchall()]
+                
+                if not all_thread_ids:
+                    raise DrawError("🏜️ 所选卡池中空空如也，像你的钱包一样。等待管理员同步帖子或发布新帖吧！")
+                
+                return all_thread_ids
+
+            finally:
+                if con:
+                    con.close()
+
+        try:
+            # --- 异步执行数据库查询 ---
+            all_thread_ids = await asyncio.to_thread(_fetch_ids_from_db)
             
-            if not all_thread_ids:
-                await interaction.followup.send("🏜️ 所选卡池中空空如也，像你的钱包一样。等待管理员同步帖子或发布新帖吧！", ephemeral=True)
-                return
-            
-            # 3. 抽取并获取帖子信息
+            # --- 帖子抽取和处理 (这部分包含异步API调用，必须在主线程) ---
             draw_count = min(count, len(all_thread_ids))
             chosen_thread_ids = random.sample(all_thread_ids, k=draw_count)
             
             embeds = []
             not_found_count = 0
-            for i, thread_id in enumerate(chosen_thread_ids):
-                try:
-                    thread = self.bot.get_channel(thread_id) or await self.bot.fetch_channel(thread_id)
-                    if not isinstance(thread, discord.Thread):
-                        not_found_count += 1
-                        continue
-                    
-                    # 检查并跳过置顶帖
-                    if thread.flags.pinned:
-                        not_found_count += 1
-                        print(f"跳过置顶帖: {thread.name} ({thread.id})")
-                        continue
+            
+            # 注意：为了简化，此处的清理数据库操作仍为同步，但它们在循环内部，
+            # 此时 defer() 已成功，所以即使有短暂阻塞也不会导致交互超时。
+            con = sqlite3.connect(DB_FILE, timeout=10)
+            cur = con.cursor()
+            try:
+                for i, thread_id in enumerate(chosen_thread_ids):
+                    try:
+                        thread = self.bot.get_channel(thread_id) or await self.bot.fetch_channel(thread_id)
+                        if not isinstance(thread, discord.Thread) or thread.flags.pinned:
+                            not_found_count += 1
+                            if isinstance(thread, discord.Thread) and thread.flags.pinned:
+                                print(f"跳过置顶帖: {thread.name} ({thread.id})")
+                            continue
 
-                    # 移除 "抽卡结果" 字样，直接显示帖子标题
-                    title = f"✨ ({i+1-not_found_count}/{draw_count})" if count > 1 else "✨ 你的天选之帖"
-                    embed = await format_post_embed(interaction, thread, title_prefix=title)
-                    if embed.title == "错误":
-                        # 帖子无效 (例如，起始消息被删除)
+                        title = f"✨ ({i+1-not_found_count}/{draw_count})" if count > 1 else "✨ 你的天选之帖"
+                        embed = await format_post_embed(interaction, thread, title_prefix=title)
+                        
+                        if embed.title == "错误":
+                            not_found_count += 1
+                            cur.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
+                            con.commit()
+                            print(f"[抽卡模块] 清理数据库: 移除了一个帖子 (ID: {thread_id})，原因: 帖子内容(起始消息)无法加载。")
+                            continue
+                        embeds.append(embed)
+
+                    except (discord.NotFound, discord.Forbidden) as e:
                         not_found_count += 1
-                        # 从数据库中删除，防止再次抽到
                         cur.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
                         con.commit()
-                        print(f"[抽卡模块] 清理数据库: 移除了一个帖子 (ID: {thread_id})，原因: 帖子内容(起始消息)无法加载。")
+                        reason = "帖子本身已被删除" if isinstance(e, discord.NotFound) else "机器人无权访问该帖子"
+                        print(f"[抽卡模块] 清理数据库: 用户 {interaction.user} (ID: {interaction.user.id}) 抽中了无法访问的帖子 (ID: {thread_id})，已自动移除。原因: {reason}")
                         continue
-                    embeds.append(embed)
-                except (discord.NotFound, discord.Forbidden) as e:
-                    # 帖子或频道本身找不到了
-                    not_found_count += 1
-                    # 同样从数据库中删除
-                    cur.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
-                    con.commit()
-                    # 添加更详细的日志
-                    reason = "帖子本身已被删除" if isinstance(e, discord.NotFound) else "机器人无权访问该帖子"
-                    print(
-                        f"[抽卡模块] 清理数据库: 用户 {interaction.user} (ID: {interaction.user.id}) "
-                        f"抽中了无法访问的帖子 (ID: {thread_id})，已自动移除。原因: {reason}"
-                    )
-                    continue
-            
+            finally:
+                con.close()
+
             if not embeds:
                 await interaction.followup.send("👻 很抱歉，抽中的帖子似乎都已消失在时空中...", ephemeral=True)
                 return
 
-            # 使用新的、功能完备的 RedrawView
             redraw_view = RedrawView(self, count)
             await interaction.followup.send(embeds=embeds, view=redraw_view, ephemeral=True)
 
+        except DrawError as e:
+            await interaction.followup.send(e.message, ephemeral=True)
         except Exception as e:
-            print(f"抽卡时发生意外错误: {e}")
+            logging.exception("抽卡时发生意外错误")
             await interaction.followup.send("🤯 糟糕！抽卡途中似乎遇到了一个意料之外的错误，请稍后再试或联系管理员。", ephemeral=True)
-        finally:
-            if con:
-                con.close()
 
     @discord.ui.button(label="抽一张", style=discord.ButtonStyle.primary, custom_id="draw_one_button", emoji="✨")
     async def draw_one_button(self, interaction: discord.Interaction, button: discord.ui.Button):

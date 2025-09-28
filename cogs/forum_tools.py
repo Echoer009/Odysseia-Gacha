@@ -66,12 +66,26 @@ class ForumTools(commands.Cog):
             print("="*50 + "\n")
             return
 
-        con = sqlite3.connect(DB_FILE)
-        cur = con.cursor()
+        def _get_last_id_from_db(forum_id):
+            con = sqlite3.connect(DB_FILE)
+            cur = con.cursor()
+            cur.execute("SELECT MAX(thread_id) FROM threads WHERE forum_id = ?", (forum_id,))
+            row = cur.fetchone()
+            con.close()
+            return row[0] if row and row[0] else None
+
+        def _insert_threads_to_db(thread_data):
+            if not thread_data:
+                return 0
+            con = sqlite3.connect(DB_FILE)
+            cur = con.cursor()
+            cur.executemany("INSERT OR IGNORE INTO threads (thread_id, forum_id, guild_id) VALUES (?, ?, ?)", thread_data)
+            row_count = cur.rowcount
+            con.commit()
+            con.close()
+            return row_count
+
         total_added = 0
-        
-        # 我们需要一个 guild 对象，但由于频道可能分散在不同服务器，
-        # 我们将通过频道对象来获取 guild
         for forum_id in forum_ids_to_scan:
             try:
                 forum = self.bot.get_channel(forum_id) or await self.bot.fetch_channel(forum_id)
@@ -80,47 +94,31 @@ class ForumTools(commands.Cog):
                     continue
                 
                 print(f"[后台任务] ==> 正在处理频道: {forum.name} (ID: {forum_id})")
-                guild = forum.guild
+                
+                last_id = await asyncio.to_thread(_get_last_id_from_db, forum_id)
 
-                cur.execute("SELECT MAX(thread_id) FROM threads WHERE forum_id = ?", (forum_id,))
-                row = cur.fetchone()
-                last_id = row[0] if row else None
-
-                # 如果数据库中没有该论坛的记录，则跳过增量同步
                 if last_id is None:
                     print(f"[后台任务] 论坛 '{forum.name}' 在数据库中为空，跳过。等待手动全量同步。")
                     continue
 
-                # 高效地只获取比 last_id 新的帖子
-                # 我们需要同时检查活跃和归档的帖子
                 new_threads = []
-                
-                # 检查活跃帖子
                 for thread in forum.threads:
                     if thread.id > last_id:
                         new_threads.append(thread)
-
-                # 检查归档帖子 (该方法不支持 'after' 参数, 我们在内存中过滤)
                 async for thread in forum.archived_threads(limit=None):
                     if thread.id > last_id:
                         new_threads.append(thread)
 
                 if new_threads:
-                    # 去重，以防万一有帖子在活跃和归档中同时出现
                     unique_new_threads = {t.id: t for t in new_threads}.values()
-                    thread_data = [(t.id, forum.id, guild.id) for t in unique_new_threads]
-                    cur.executemany("INSERT OR IGNORE INTO threads (thread_id, forum_id, guild_id) VALUES (?, ?, ?)", thread_data)
-                    total_added += cur.rowcount
+                    thread_data = [(t.id, forum.id, forum.guild.id) for t in unique_new_threads]
+                    added_count = await asyncio.to_thread(_insert_threads_to_db, thread_data)
+                    total_added += added_count
 
             except discord.Forbidden:
-                print(f"[后台任务] 权限不足，无法增量同步论坛 '{forum.name}' (ID: {forum_id})。")
+                print(f"[后台任务] 权限不足，无法增量同步论坛 (ID: {forum_id})。")
             except Exception as e:
-                # 确保即使 forum 对象获取失败，我们也能知道是哪个ID出错了
-                forum_name_for_log = f"'{forum.name}' " if 'forum' in locals() and forum else ""
-                print(f"[后台任务] 增量同步论坛 {forum_name_for_log}(ID: {forum_id}) 时出错: {type(e).__name__}: {e}")
-        
-        con.commit()
-        con.close()
+                print(f"[后台任务] 增量同步论坛 (ID: {forum_id}) 时出错: {type(e).__name__}: {e}")
         
         if total_added > 0:
             print(f"[后台任务] 增量同步完成。本次新增了 {total_added} 个帖子。")
@@ -150,17 +148,20 @@ class ForumTools(commands.Cog):
             return
 
         # 1. 更新数据库
-        try:
-            con = sqlite3.connect(DB_FILE)
-            cur = con.cursor()
-            cur.execute(
-                "INSERT OR IGNORE INTO threads (thread_id, forum_id, guild_id) VALUES (?, ?, ?)",
-                (thread.id, forum_id, thread.guild.id)
-            )
-            con.commit()
-            con.close()
-        except Exception as e:
-            print(f"数据库错误 (on_thread_create): {e}")
+        def _update_db(thread_id, forum_id, guild_id):
+            try:
+                con = sqlite3.connect(DB_FILE)
+                cur = con.cursor()
+                cur.execute(
+                    "INSERT OR IGNORE INTO threads (thread_id, forum_id, guild_id) VALUES (?, ?, ?)",
+                    (thread_id, forum_id, guild_id)
+                )
+                con.commit()
+                con.close()
+            except Exception as e:
+                print(f"数据库错误 (on_thread_create): {e}")
+
+        await asyncio.to_thread(_update_db, thread.id, forum_id, thread.guild.id)
 
         # 2. 处理新帖速递
         delivery_channel_id = self.bot.delivery_channel_id
@@ -232,8 +233,20 @@ class ForumTools(commands.Cog):
                 tags_str = ", ".join(tag.name for tag in thread.applied_tags)
                 embed.add_field(name="🏷️ 标签", value=tags_str, inline=False)
             
-            await delivery_channel.send(embed=embed)
-            print(f"[新帖速递] ✅ 成功发送了关于帖子 '{thread.name}' 的速递到频道 '{delivery_channel.name}'。")
+            # --- 诊断日志：打印将要发送的 Embed 内容 ---
+            print(f"[诊断日志] 准备为帖子 '{thread.name}' (ID: {thread.id}) 发送以下 Embed 内容:\n{embed.to_dict()}")
+            
+            try:
+                await delivery_channel.send(embed=embed)
+                print(f"[新帖速递] ✅ 成功发送了关于帖子 '{thread.name}' 的速递到频道 '{delivery_channel.name}'。")
+            except discord.HTTPException as e:
+                print(f"[新帖速递] ‼️ 发送速递时遇到HTTP异常: {e.status} {e.text}。将在2秒后重试...")
+                await asyncio.sleep(2)
+                try:
+                    await delivery_channel.send(embed=embed)
+                    print(f"[新帖速递] ✅ 重试成功！成功发送了关于帖子 '{thread.name}' 的速递。")
+                except Exception as final_e:
+                    print(f"[新帖速递] ❌ 重试失败！最终未能发送关于帖子 '{thread.name}' 的速递。最终错误: {final_e}")
 
         except discord.errors.Forbidden as e:
             print(f"[新帖速递] 权限错误：机器人没有权限在频道 '{delivery_channel.name}' 中发送消息。详细错误: {e}")
@@ -334,35 +347,38 @@ class ForumTools(commands.Cog):
             await interaction.followup.send("❌ **配置错误**：机器人尚未在 `.env` 文件中配置 `ALLOWED_CHANNEL_IDS`。", ephemeral=True)
             return
 
-        # --- 同步逻辑 ---
+        # --- 异步收集数据 ---
+        all_thread_data = []
         guild = interaction.guild
-        con = sqlite3.connect(DB_FILE)
-        cur = con.cursor()
-        
-        total_added = 0
         for forum_id in forum_ids_to_scan:
-            # 确保频道属于当前服务器
             forum = guild.get_channel(forum_id)
             if not forum or not isinstance(forum, discord.ForumChannel):
                 continue
-
             try:
-                all_threads = forum.threads
+                active_threads = forum.threads
                 archived_threads = [t async for t in forum.archived_threads(limit=None)]
-                all_threads.extend(archived_threads)
                 
-                thread_data = [(thread.id, forum.id, guild.id) for thread in all_threads]
-                if thread_data:
-                    cur.executemany("INSERT OR IGNORE INTO threads (thread_id, forum_id, guild_id) VALUES (?, ?, ?)", thread_data)
-                    total_added += cur.rowcount
+                for thread in active_threads + archived_threads:
+                    all_thread_data.append((thread.id, forum.id, guild.id))
             except discord.Forbidden:
                 print(f"[手动同步] 权限警告：无法同步论坛 {forum.mention} 的归档帖子。")
             except Exception as e:
-                print(f"[手动同步] 同步论坛 '{forum.name}' 时出错: {e}")
+                print(f"[手动同步] 收集论坛 '{forum.name}' 数据时出错: {e}")
 
-        con.commit()
-        con.close()
+        # --- 同步写入数据库 ---
+        def _write_to_db(data):
+            if not data:
+                return 0
+            con = sqlite3.connect(DB_FILE)
+            cur = con.cursor()
+            cur.executemany("INSERT OR IGNORE INTO threads (thread_id, forum_id, guild_id) VALUES (?, ?, ?)", data)
+            added_count = cur.rowcount
+            con.commit()
+            con.close()
+            return added_count
 
+        total_added = await asyncio.to_thread(_write_to_db, all_thread_data)
+        
         await interaction.followup.send(f"✅ **全量同步完成！** 本次新增了 **{total_added}** 个帖子到总卡池中。", ephemeral=True)
 
     @config_group.command(name="设置速递频道", description="【重要】设置或更新新帖速递的目标频道。")
@@ -381,12 +397,9 @@ class ForumTools(commands.Cog):
             return
         
         try:
-            # 获取 .env 文件的路径
             dotenv_path = os.path.join(os.getcwd(), '.env')
-            # 使用 set_key 来更新 .env 文件
-            set_key(dotenv_path, "DELIVERY_CHANNEL_ID", str(channel.id))
+            await asyncio.to_thread(set_key, dotenv_path, "DELIVERY_CHANNEL_ID", str(channel.id))
             
-            # 更新 bot 实例中的在内存中的值，以便立即生效（如果可能）
             self.bot.delivery_channel_id = channel.id
             
             await interaction.response.send_message(
@@ -413,10 +426,8 @@ class ForumTools(commands.Cog):
 
         try:
             dotenv_path = os.path.join(os.getcwd(), '.env')
-            # 使用 unset_key 来移除 .env 文件中的键
-            unset_key(dotenv_path, "DELIVERY_CHANNEL_ID")
+            await asyncio.to_thread(unset_key, dotenv_path, "DELIVERY_CHANNEL_ID")
 
-            # 更新 bot 实例中的在内存中的值
             self.bot.delivery_channel_id = None
 
             await interaction.response.send_message(
@@ -443,20 +454,17 @@ class ForumTools(commands.Cog):
             return
 
         try:
-            dotenv_path = os.path.join(os.getcwd(), '.env')
-            # 读取现有配置
-            current_ids_str = os.getenv("ALLOWED_CHANNEL_IDS", "")
-            current_ids = {cid.strip() for cid in current_ids_str.split(',') if cid.strip()}
-            
-            # 添加新ID
-            current_ids.add(str(channel.id))
-            
-            # 写回 .env
-            new_ids_str = ",".join(current_ids)
-            set_key(dotenv_path, "ALLOWED_CHANNEL_IDS", new_ids_str)
+            def _update_env():
+                dotenv_path = os.path.join(os.getcwd(), '.env')
+                current_ids_str = os.getenv("ALLOWED_CHANNEL_IDS", "")
+                current_ids = {cid.strip() for cid in current_ids_str.split(',') if cid.strip()}
+                current_ids.add(str(channel.id))
+                new_ids_str = ",".join(current_ids)
+                set_key(dotenv_path, "ALLOWED_CHANNEL_IDS", new_ids_str)
+                return {int(cid) for cid in current_ids}
 
-            # 更新内存中的配置
-            self.bot.allowed_forum_ids = {int(cid) for cid in current_ids}
+            updated_ids = await asyncio.to_thread(_update_env)
+            self.bot.allowed_forum_ids = updated_ids
 
             await interaction.response.send_message(
                 f"✅ **成功!** 已将论坛频道 {channel.mention} 添加到监控列表。\n"
@@ -482,20 +490,18 @@ class ForumTools(commands.Cog):
             return
 
         try:
-            dotenv_path = os.path.join(os.getcwd(), '.env')
-            # 读取现有配置
-            current_ids_str = os.getenv("ALLOWED_CHANNEL_IDS", "")
-            current_ids = {cid.strip() for cid in current_ids_str.split(',') if cid.strip()}
+            def _update_env():
+                dotenv_path = os.path.join(os.getcwd(), '.env')
+                current_ids_str = os.getenv("ALLOWED_CHANNEL_IDS", "")
+                current_ids = {cid.strip() for cid in current_ids_str.split(',') if cid.strip()}
+                current_ids.discard(str(channel.id))
+                new_ids_str = ",".join(current_ids)
+                set_key(dotenv_path, "ALLOWED_CHANNEL_IDS", new_ids_str)
+                # Handle case where new_ids_str is empty
+                return {int(cid) for cid in current_ids} if current_ids else set()
 
-            # 移除ID
-            current_ids.discard(str(channel.id))
-
-            # 写回 .env
-            new_ids_str = ",".join(current_ids)
-            set_key(dotenv_path, "ALLOWED_CHANNEL_IDS", new_ids_str)
-
-            # 更新内存中的配置
-            self.bot.allowed_forum_ids = {int(cid) for cid in current_ids}
+            updated_ids = await asyncio.to_thread(_update_env)
+            self.bot.allowed_forum_ids = updated_ids
 
             await interaction.response.send_message(
                 f"✅ **成功!** 已将论坛频道 {channel.mention} 从监控列表中移除。\n"

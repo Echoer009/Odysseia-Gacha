@@ -29,20 +29,19 @@ class BackupManager(commands.Cog):
     def cog_unload(self):
         self.backup_database.cancel()
 
-    @tasks.loop(hours=24)
-    async def backup_database(self):
+    def _run_backup_and_cleanup(self):
         """
-        每天执行一次的数据库备份和清理任务。
+        在同步函数中执行所有阻塞的文件 I/O 操作。
         """
-        log.info("--- 开始执行每日数据库备份任务 ---")
+        log.info("--- [同步线程] 开始执行每日数据库备份任务 ---")
         
-        # 确保备份目录存在
-        if not os.path.exists(BACKUP_DIR):
-            os.makedirs(BACKUP_DIR)
-            log.info(f"创建备份目录: {BACKUP_DIR}")
-
-        # 1. 执行备份
         try:
+            # 确保备份目录存在
+            if not os.path.exists(BACKUP_DIR):
+                os.makedirs(BACKUP_DIR)
+                log.info(f"创建备份目录: {BACKUP_DIR}")
+
+            # 1. 执行备份
             source_path = DB_FILE
             if not os.path.exists(source_path):
                 log.warning(f"数据库文件 '{source_path}' 不存在，跳过本次备份。")
@@ -62,30 +61,39 @@ class BackupManager(commands.Cog):
         try:
             cutoff_date = datetime.now() - timedelta(days=BACKUP_RETENTION_DAYS)
             files_deleted = 0
-            for filename in os.listdir(BACKUP_DIR):
-                if filename.startswith('backup_') and filename.endswith('.db'):
-                    file_path = os.path.join(BACKUP_DIR, filename)
-                    try:
-                        # 从文件名解析日期
-                        timestamp_str = filename.replace('backup_', '').replace('.db', '')
-                        file_date = datetime.strptime(timestamp_str, '%Y-%m-%d_%H-%M-%S')
-                        
-                        if file_date < cutoff_date:
-                            os.remove(file_path)
-                            log.info(f"🗑️ 已删除旧备份文件: {filename}")
-                            files_deleted += 1
-                    except (ValueError, IndexError):
-                        log.warning(f"无法解析备份文件的时间戳，已跳过: {filename}")
-                        continue
-            if files_deleted > 0:
-                log.info(f"清理任务完成，共删除了 {files_deleted} 个旧备份。")
+            if os.path.exists(BACKUP_DIR):
+                for filename in os.listdir(BACKUP_DIR):
+                    if filename.startswith('backup_') and filename.endswith('.db'):
+                        file_path = os.path.join(BACKUP_DIR, filename)
+                        try:
+                            timestamp_str = filename.replace('backup_', '').replace('.db', '')
+                            file_date = datetime.strptime(timestamp_str, '%Y-%m-%d_%H-%M-%S')
+                            
+                            if file_date < cutoff_date:
+                                os.remove(file_path)
+                                log.info(f"🗑️ 已删除旧备份文件: {filename}")
+                                files_deleted += 1
+                        except (ValueError, IndexError):
+                            log.warning(f"无法解析备份文件的时间戳，已跳过: {filename}")
+                            continue
+                if files_deleted > 0:
+                    log.info(f"清理任务完成，共删除了 {files_deleted} 个旧备份。")
+                else:
+                    log.info("没有需要清理的旧备份。")
             else:
-                log.info("没有需要清理的旧备份。")
+                log.info("备份目录不存在，跳过清理。")
 
         except Exception as e:
             log.error(f"❌ 清理旧备份时发生错误: {e}", exc_info=True)
         
-        log.info("--- 每日数据库备份任务执行完毕 ---")
+        log.info("--- [同步线程] 每日数据库备份任务执行完毕 ---")
+
+    @tasks.loop(hours=24)
+    async def backup_database(self):
+        """
+        每天执行一次的数据库备份和清理任务（异步包装器）。
+        """
+        await asyncio.to_thread(self._run_backup_and_cleanup)
 
     @backup_database.before_loop
     async def before_backup_loop(self):
