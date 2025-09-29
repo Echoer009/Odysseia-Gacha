@@ -134,17 +134,21 @@ class ForumTools(commands.Cog):
         同时处理新帖速递和数据库更新。
         """
         forum_id = thread.parent_id
-        print(f"[新帖监听] 检测到新帖子 '{thread.name}' (ID: {thread.id}) 在频道 '{thread.parent.name}' (ID: {forum_id}) 中创建。")
+        def log_with_timestamp(message):
+            """一个简单的日志记录函数，自动添加时间戳。"""
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+
+        log_with_timestamp(f"[新帖监听] 检测到新帖子 '{thread.name}' (ID: {thread.id}) 在频道 '{thread.parent.name}' (ID: {forum_id}) 中创建。")
 
         # --- 检查帖子来源是否在监控且未被排除的频道列表中 ---
         # 1. 必须在总的监控列表里
         if forum_id not in self.bot.allowed_forum_ids:
-            print(f"[新帖监听] 忽略：帖子源频道 '{thread.parent.name}' 不在 .env 配置的 ALLOWED_CHANNEL_IDS 监控列表中。")
+            log_with_timestamp(f"[新帖监听] 忽略：帖子源频道 '{thread.parent.name}' 不在 .env 配置的 ALLOWED_CHANNEL_IDS 监控列表中。")
             return
         
         # 2. 不能在排除列表里
         if forum_id in self.bot.default_pool_exclusions:
-            print(f"[新帖监听] 忽略：帖子源频道 '{thread.parent.name}' 在 .env 配置的 DEFAULT_POOL_EXCLUSIONS 排除列表中，因此不进行速递。")
+            log_with_timestamp(f"[新帖监听] 忽略：帖子源频道 '{thread.parent.name}' 在 .env 配置的 DEFAULT_POOL_EXCLUSIONS 排除列表中，因此不进行速递。")
             return
 
         # 1. 更新数据库
@@ -159,7 +163,7 @@ class ForumTools(commands.Cog):
                 con.commit()
                 con.close()
             except Exception as e:
-                print(f"数据库错误 (on_thread_create): {e}")
+                log_with_timestamp(f"数据库错误 (on_thread_create): {e}")
 
         await asyncio.to_thread(_update_db, thread.id, forum_id, thread.guild.id)
 
@@ -172,39 +176,55 @@ class ForumTools(commands.Cog):
         if not delivery_channel:
             # 仅在第一次找不到时打印一次警告，避免刷屏
             if not hasattr(self, '_delivery_channel_warning_sent'):
-                print(f"错误：在 .env 中配置的速递频道ID {delivery_channel_id} 找不到。")
+                log_with_timestamp(f"错误：在 .env 中配置的速递频道ID {delivery_channel_id} 找不到。")
                 self._delivery_channel_warning_sent = True
             return
 
         # --- 步骤 2a: 构造并发送速递消息 ---
         try:
+            # --- 从 .env 加载速递相关配置, 提供默认值 ---
+            try:
+                fetch_delay = float(os.getenv("FETCH_STARTER_MESSAGE_DELAY_SECONDS", "3.0"))
+                send_max_attempts = int(os.getenv("DELIVERY_MAX_RETRIES", "3"))
+                send_retry_delay = float(os.getenv("DELIVERY_RETRY_DELAY_SECONDS", "2.0"))
+            except ValueError:
+                log_with_timestamp("⚠️ .env 文件中的速递配置值无效，将使用默认值。")
+                fetch_delay = 3.0
+                send_max_attempts = 3
+                send_retry_delay = 2.0
+
+            # --- 等待一段时间，以应对 Discord API 的最终一致性 ---
+            if fetch_delay > 0:
+                log_with_timestamp(f"[新帖速递] 等待 {fetch_delay} 秒，以确保起始消息可被获取...")
+                await asyncio.sleep(fetch_delay)
+
             starter_message = None
             # --- 引入重试机制来获取起始消息，以应对 Discord API 的最终一致性延迟 ---
-            max_retries = 2
+            max_retries = 2 # 这个是获取消息的重试，与发送重试不同，暂时保留硬编码
             retry_delay = 2 # 秒
             for attempt in range(max_retries):
                 try:
                     starter_message = thread.starter_message or await thread.fetch_message(thread.id)
                     # 如果是在重试后成功的，就打印一条成功日志
                     if attempt > 0:
-                        print(f"[新帖速递] 信息：在第 {attempt + 1} 次尝试后，成功获取到帖子 '{thread.name}' 的起始消息。")
+                        log_with_timestamp(f"[新帖速递] 信息：在第 {attempt + 1} 次尝试后，成功获取到帖子 '{thread.name}' 的起始消息。")
                     # 如果成功获取，就跳出循环
                     break
                 except discord.NotFound:
                     if attempt < max_retries - 1:
-                        print(f"[新帖速递] 注意：尝试第 {attempt + 1} 次获取帖子 '{thread.name}' 的起始消息失败 (NotFound)。将在 {retry_delay} 秒后重试...")
+                        log_with_timestamp(f"[新帖速递] 注意：尝试第 {attempt + 1} 次获取帖子 '{thread.name}' 的起始消息失败 (NotFound)。将在 {retry_delay} 秒后重试...")
                         await asyncio.sleep(retry_delay)
                     else:
                         # 这是最后一次尝试，仍然失败
-                        print(f"[新帖速递] 失败：在 {max_retries} 次尝试后，仍无法获取帖子 '{thread.name}' 的起始消息 (NotFound)。已跳过本次速递。")
+                        log_with_timestamp(f"[新帖速递] 失败：在 {max_retries} 次尝试后，仍无法获取帖子 '{thread.name}' 的起始消息 (NotFound)。已跳过本次速递。")
                         return
                 except discord.Forbidden as e:
                     # 如果是权限问题，重试没有意义，直接放弃
-                    print(f"[新帖速递] 失败：无法获取帖子 '{thread.name}' 的起始消息，因为机器人权限不足。已跳过本次速递。原因: {e}")
+                    log_with_timestamp(f"[新帖速递] 失败：无法获取帖子 '{thread.name}' 的起始消息，因为机器人权限不足。已跳过本次速递。原因: {e}")
                     return
                 except Exception as e:
                     # 捕获其他可能的未知错误
-                    print(f"[新帖速递] 失败：获取帖子 '{thread.name}' 的起始消息时发生未知错误。已跳过本次速递。原因: {e}")
+                    log_with_timestamp(f"[新帖速递] 失败：获取帖子 '{thread.name}' 的起始消息时发生未知错误。已跳过本次速递。原因: {e}")
                     return
 
             author_mention = f"**👤 作者:** {thread.owner.name}" if thread.owner else f"**👤 作者:** 未知"
@@ -234,26 +254,44 @@ class ForumTools(commands.Cog):
                 embed.add_field(name="🏷️ 标签", value=tags_str, inline=False)
             
             # --- 诊断日志：打印将要发送的 Embed 内容 ---
-            print(f"[诊断日志] 准备为帖子 '{thread.name}' (ID: {thread.id}) 发送以下 Embed 内容:\n{embed.to_dict()}")
+            log_with_timestamp(f"[诊断日志] 准备为帖子 '{thread.name}' (ID: {thread.id}) 发送以下 Embed 内容:\n{embed.to_dict()}")
             
-            try:
-                await delivery_channel.send(embed=embed)
-                print(f"[新帖速递] ✅ 成功发送了关于帖子 '{thread.name}' 的速递到频道 '{delivery_channel.name}'。")
-            except discord.HTTPException as e:
-                print(f"[新帖速递] ‼️ 发送速递时遇到HTTP异常: {e.status} {e.text}。将在2秒后重试...")
-                await asyncio.sleep(2)
+            # --- 引入带验证的发送重试循环 ---
+            for attempt in range(send_max_attempts):
                 try:
-                    await delivery_channel.send(embed=embed)
-                    print(f"[新帖速递] ✅ 重试成功！成功发送了关于帖子 '{thread.name}' 的速递。")
-                except Exception as final_e:
-                    print(f"[新帖速递] ❌ 重试失败！最终未能发送关于帖子 '{thread.name}' 的速递。最终错误: {final_e}")
+                    log_with_timestamp(f"[新帖速递] 正在进行第 {attempt + 1}/{send_max_attempts} 次发送尝试...")
+                    sent_message = await delivery_channel.send(embed=embed)
 
+                    # --- 关键验证步骤 ---
+                    if sent_message and sent_message.embeds:
+                        log_with_timestamp(f"[新帖速递] ✅ 第 {attempt + 1} 次尝试成功！消息 (ID: {sent_message.id}) 已成功发送并包含 Embed。")
+                        break # 成功，跳出循环
+                    else:
+                        log_with_timestamp(f"[新帖速递] ⚠️ 第 {attempt + 1} 次尝试失败：API返回了空消息或无效消息对象。将在 {send_retry_delay} 秒后重试...")
+                        await asyncio.sleep(send_retry_delay)
+
+                except discord.HTTPException as e:
+                    log_with_timestamp(f"[新帖速递] ‼️ 第 {attempt + 1} 次尝试时遇到HTTP异常: {e.status} {e.text}。将在 {send_retry_delay} 秒后重试...")
+                    await asyncio.sleep(send_retry_delay)
+                except Exception as e:
+                    log_with_timestamp(f"[新帖速递] ‼️ 第 {attempt + 1} 次尝试时遇到未知错误: {type(e).__name__}: {e}。")
+                    # 对于未知错误，可能重试也无用，直接跳出
+                    break
+            else:
+                # --- 如果 for 循环正常结束（即没有被 break），则意味着所有尝试都失败了 ---
+                log_with_timestamp(f"[新帖速递] ❌ 最终失败：在 {send_max_attempts} 次尝试后，仍未能成功发送关于帖子 '{thread.name}' 的速递。")
+                # 即使速递失败，也继续尝试重建面板，以防面板丢失
+        
         except discord.errors.Forbidden as e:
-            print(f"[新帖速递] 权限错误：机器人没有权限在频道 '{delivery_channel.name}' 中发送消息。详细错误: {e}")
+            log_with_timestamp(f"[新帖速递] 权限错误：机器人没有权限在频道 '{delivery_channel.name}' 中发送消息。详细错误: {e}")
             return # 无法发送速递，后续操作也无法进行，直接返回
         except Exception as e:
-            print(f"[新帖速递] 失败：在发送速递消息时发生未知错误: {e}")
-            return # 发送速递失败，后续操作也无法进行，直接返回
+            log_with_timestamp(f"[新帖速递] 失败：在发送速递消息时发生未知错误: {e}")
+            # 即使速递失败，也继续尝试重建面板
+        
+        # --- 增加战略性延迟以避免速率限制 ---
+        log_with_timestamp("[面板管理] 等待 2 秒，以避免触发速率限制...")
+        await asyncio.sleep(2)
 
         # --- 步骤 2b: 重建抽卡面板 ---
         try:
@@ -295,18 +333,30 @@ class ForumTools(commands.Cog):
             async for message in channel.history(limit=None, oldest_first=True):
                 # 如果消息比时间限制还早，就处理它
                 if message.created_at < time_limit:
-                    # 只删除带有 "新卡速递" embed 的机器人消息
+                    # --- 规则1: 删除带有 "新卡速递" embed 的旧机器人消息 ---
                     if message.author == self.bot.user and message.embeds:
                         if message.embeds[0].title and "新卡速递" in message.embeds[0].title:
                             try:
                                 await message.delete()
                                 deleted_count += 1
+                                await asyncio.sleep(1) # 增加延迟避免速率限制
                             except discord.Forbidden:
                                 print(f"[清理任务] 权限不足，无法删除消息 {message.id}。")
-                                # 如果遇到权限问题，很可能后续也无法删除，直接停止本次任务
                                 break
                             except discord.HTTPException as e:
                                 print(f"[清理任务] 删除消息 {message.id} 时出错: {e}")
+                    # --- 规则2: 删除由机器人发送的、完全为空的旧消息 ---
+                    elif message.author == self.bot.user and not message.embeds and not message.content:
+                        try:
+                            await message.delete()
+                            deleted_count += 1
+                            print(f"[清理任务] 发现并删除了一条旧的空消息 (ID: {message.id})。")
+                            await asyncio.sleep(1) # 增加延迟避免速率限制
+                        except discord.Forbidden:
+                            print(f"[清理任务] 权限不足，无法删除空消息 {message.id}。")
+                            break
+                        except discord.HTTPException as e:
+                            print(f"[清理任务] 删除空消息 {message.id} 时出错: {e}")
                 else:
                     # 因为我们从最旧的消息开始，一旦遇到一个在24小时内的消息，
                     # 就可以确定后面的所有消息都是新的，无需再检查
