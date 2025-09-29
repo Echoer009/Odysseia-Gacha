@@ -10,6 +10,7 @@ from typing import Optional
 import datetime
 from dotenv import set_key, unset_key
 from .random_post import create_gacha_panel
+import json
 
 # --- 数据库文件路径 ---
 DB_FILE = 'posts.db'
@@ -168,147 +169,131 @@ class ForumTools(commands.Cog):
         await asyncio.to_thread(_update_db, thread.id, forum_id, thread.guild.id)
 
         # 2. 处理新帖速递
+        # 2. 异步处理新帖速递
+        # 创建一个后台任务来处理，这样 on_thread_create 不会被长时间阻塞
+        asyncio.create_task(self._send_delivery_with_retries(thread))
+
+    async def _send_delivery_with_retries(self, thread: discord.Thread):
+        """
+        一个独立的、带重试逻辑的异步任务，用于构建和发送新帖速递。
+        每次重试都会从头开始构建 Embed。
+        """
+        # --- 从 .env 加载速递相关配置, 提供默认值 ---
+        try:
+            fetch_delay = float(os.getenv("FETCH_STARTER_MESSAGE_DELAY_SECONDS", "15.0"))
+            send_max_attempts = int(os.getenv("DELIVERY_MAX_RETRIES", "5"))
+            send_retry_delay = float(os.getenv("DELIVERY_RETRY_DELAY_SECONDS", "60.0"))
+        except ValueError:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ⚠️ .env 文件中的速递配置值无效，将使用默认值。")
+            fetch_delay = 15.0
+            send_max_attempts = 5
+            send_retry_delay = 60.0
+
         delivery_channel_id = self.bot.delivery_channel_id
         if not delivery_channel_id:
             return
         
         delivery_channel = self.bot.get_channel(delivery_channel_id)
         if not delivery_channel:
-            # 仅在第一次找不到时打印一次警告，避免刷屏
-            if not hasattr(self, '_delivery_channel_warning_sent'):
-                log_with_timestamp(f"错误：在 .env 中配置的速递频道ID {delivery_channel_id} 找不到。")
-                self._delivery_channel_warning_sent = True
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ❌ 错误：在 .env 中配置的速递频道ID {delivery_channel_id} 找不到。")
             return
 
-        # --- 步骤 2a: 构造并发送速递消息 ---
-        try:
-            # --- 从 .env 加载速递相关配置, 提供默认值 ---
+        # --- 首次尝试前的初始延迟 ---
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] 检测到新帖 '{thread.name}'。等待 {fetch_delay} 秒，以确保CDN资源就绪...")
+        await asyncio.sleep(fetch_delay)
+
+        for attempt in range(send_max_attempts):
             try:
-                fetch_delay = float(os.getenv("FETCH_STARTER_MESSAGE_DELAY_SECONDS", "3.0"))
-                send_max_attempts = int(os.getenv("DELIVERY_MAX_RETRIES", "3"))
-                send_retry_delay = float(os.getenv("DELIVERY_RETRY_DELAY_SECONDS", "2.0"))
-            except ValueError:
-                log_with_timestamp("⚠️ .env 文件中的速递配置值无效，将使用默认值。")
-                fetch_delay = 3.0
-                send_max_attempts = 3
-                send_retry_delay = 2.0
-
-            # --- 等待一段时间，以应对 Discord API 的最终一致性 ---
-            if fetch_delay > 0:
-                log_with_timestamp(f"[新帖速递] 等待 {fetch_delay} 秒，以确保起始消息可被获取...")
-                await asyncio.sleep(fetch_delay)
-
-            starter_message = None
-            # --- 引入重试机制来获取起始消息，以应对 Discord API 的最终一致性延迟 ---
-            max_retries = 2 # 这个是获取消息的重试，与发送重试不同，暂时保留硬编码
-            retry_delay = 2 # 秒
-            for attempt in range(max_retries):
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] 正在为 '{thread.name}' 进行第 {attempt + 1}/{send_max_attempts} 次构建和发送尝试...")
+                
+                # --- 步骤 1: 在每次循环内部获取起始消息 ---
+                starter_message = None
                 try:
-                    starter_message = thread.starter_message or await thread.fetch_message(thread.id)
-                    # 如果是在重试后成功的，就打印一条成功日志
-                    if attempt > 0:
-                        log_with_timestamp(f"[新帖速递] 信息：在第 {attempt + 1} 次尝试后，成功获取到帖子 '{thread.name}' 的起始消息。")
-                    # 如果成功获取，就跳出循环
-                    break
-                except discord.NotFound:
-                    if attempt < max_retries - 1:
-                        log_with_timestamp(f"[新帖速递] 注意：尝试第 {attempt + 1} 次获取帖子 '{thread.name}' 的起始消息失败 (NotFound)。将在 {retry_delay} 秒后重试...")
-                        await asyncio.sleep(retry_delay)
-                    else:
-                        # 这是最后一次尝试，仍然失败
-                        log_with_timestamp(f"[新帖速递] 失败：在 {max_retries} 次尝试后，仍无法获取帖子 '{thread.name}' 的起始消息 (NotFound)。已跳过本次速递。")
-                        return
-                except discord.Forbidden as e:
-                    # 如果是权限问题，重试没有意义，直接放弃
-                    log_with_timestamp(f"[新帖速递] 失败：无法获取帖子 '{thread.name}' 的起始消息，因为机器人权限不足。已跳过本次速递。原因: {e}")
-                    return
-                except Exception as e:
-                    # 捕获其他可能的未知错误
-                    log_with_timestamp(f"[新帖速递] 失败：获取帖子 '{thread.name}' 的起始消息时发生未知错误。已跳过本次速递。原因: {e}")
-                    return
+                    # 使用更短的超时来快速失败
+                    starter_message = await asyncio.wait_for(thread.fetch_message(thread.id), timeout=10.0)
+                except (discord.NotFound, asyncio.TimeoutError):
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] 注意：在第 {attempt + 1} 次尝试中未能获取到帖子 '{thread.name}' 的起始消息。")
+                    # 即使没有消息，我们仍然可以发送一个不带内容的速递
+                    pass
+                except discord.Forbidden:
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ❌ 失败：机器人权限不足，无法获取帖子 '{thread.name}' 的起始消息。已终止对此帖的速递。")
+                    return # 权限问题无法通过重试解决，直接返回
 
-            author_mention = f"**👤 作者:** {thread.owner.name}" if thread.owner else f"**👤 作者:** 未知"
-            header_line = f"**{thread.name}** | {author_mention}"
+                # --- 步骤 2: 在每次循环内部构建 Embed ---
+                author_mention = f"**👤 作者:** {thread.owner.name}" if thread.owner else f"**👤 作者:** 未知"
+                thread_title = thread.name[:97] + "..." if len(thread.name) > 100 else thread.name
+                header_line = f"**{thread_title}** | {author_mention}"
 
-            if starter_message:
-                post_content = starter_message.content
-                if len(post_content) > 400:
-                    post_content = post_content[:400] + "..."
-                content_section = f"**📝 内容速览:**\n{post_content}"
-            else:
-                content_section = "**📝 内容速览:**\n*(无法加载起始消息，可能已被删除或帖子格式特殊)*"
-            
-            full_description = f"{header_line}\n\n{content_section}"
-            embed = discord.Embed(title="✨ 新卡速递", description=full_description, color=discord.Color.blue())
-            embed.add_field(name="🚪 传送门", value=f"[点击查看原帖]({thread.jump_url})", inline=False)
+                if starter_message and starter_message.content:
+                    post_content = starter_message.content
+                    if len(post_content) > 400:
+                        post_content = post_content[:400] + "..."
+                    content_section = f"**📝 内容速览:**\n{post_content}"
+                else:
+                    content_section = "**📝 内容速览:**\n*(无法加载起始消息，可能已被删除或帖子格式特殊)*"
+                
+                full_description = f"{header_line}\n\n{content_section}"
+                embed = discord.Embed(title="✨ 新卡速递", description=full_description, color=discord.Color.blue())
+                embed.add_field(name="🚪 传送门", value=f"[点击查看原帖]({thread.jump_url})", inline=False)
 
-            # 只有在 starter_message 存在时，才检查附件
-            if starter_message and starter_message.attachments:
-                for attachment in starter_message.attachments:
-                    if attachment.content_type and attachment.content_type.startswith('image/'):
-                        embed.set_thumbnail(url=attachment.url)
-                        break
-            
-            if thread.applied_tags:
-                tags_str = ", ".join(tag.name for tag in thread.applied_tags)
-                embed.add_field(name="🏷️ 标签", value=tags_str, inline=False)
-            
-            # --- 诊断日志：打印将要发送的 Embed 内容 ---
-            log_with_timestamp(f"[诊断日志] 准备为帖子 '{thread.name}' (ID: {thread.id}) 发送以下 Embed 内容:\n{embed.to_dict()}")
-            
-            # --- 引入带验证的发送重试循环 ---
-            for attempt in range(send_max_attempts):
-                try:
-                    log_with_timestamp(f"[新帖速递] 正在进行第 {attempt + 1}/{send_max_attempts} 次发送尝试...")
-                    sent_message = await delivery_channel.send(embed=embed)
+                if starter_message and starter_message.attachments:
+                    for attachment in starter_message.attachments:
+                        if attachment.content_type and attachment.content_type.startswith('image/'):
+                            embed.set_thumbnail(url=attachment.url)
+                            break
+                
+                if thread.applied_tags:
+                    tags_str = ", ".join(tag.name for tag in thread.applied_tags)
+                    if len(tags_str) > 1024:
+                        tags_str = tags_str[:1021] + "..."
+                    embed.add_field(name="🏷️ 标签", value=tags_str, inline=False)
 
-                    # --- 关键验证步骤 ---
-                    if sent_message and sent_message.embeds:
-                        log_with_timestamp(f"[新帖速递] ✅ 第 {attempt + 1} 次尝试成功！消息 (ID: {sent_message.id}) 已成功发送并包含 Embed。")
-                        break # 成功，跳出循环
-                    else:
-                        log_with_timestamp(f"[新帖速递] ⚠️ 第 {attempt + 1} 次尝试失败：API返回了空消息或无效消息对象。将在 {send_retry_delay} 秒后重试...")
-                        await asyncio.sleep(send_retry_delay)
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [诊断日志] 准备为帖子 '{thread.name}' (ID: {thread.id}) 发送以下 Embed 内容:\n{embed.to_dict()}")
 
-                except discord.HTTPException as e:
-                    log_with_timestamp(f"[新帖速递] ‼️ 第 {attempt + 1} 次尝试时遇到HTTP异常: {e.status} {e.text}。将在 {send_retry_delay} 秒后重试...")
-                    await asyncio.sleep(send_retry_delay)
-                except Exception as e:
-                    log_with_timestamp(f"[新帖速递] ‼️ 第 {attempt + 1} 次尝试时遇到未知错误: {type(e).__name__}: {e}。")
-                    # 对于未知错误，可能重试也无用，直接跳出
-                    break
-            else:
-                # --- 如果 for 循环正常结束（即没有被 break），则意味着所有尝试都失败了 ---
-                log_with_timestamp(f"[新帖速递] ❌ 最终失败：在 {send_max_attempts} 次尝试后，仍未能成功发送关于帖子 '{thread.name}' 的速递。")
-                # 即使速递失败，也继续尝试重建面板，以防面板丢失
-        
-        except discord.errors.Forbidden as e:
-            log_with_timestamp(f"[新帖速递] 权限错误：机器人没有权限在频道 '{delivery_channel.name}' 中发送消息。详细错误: {e}")
-            return # 无法发送速递，后续操作也无法进行，直接返回
-        except Exception as e:
-            log_with_timestamp(f"[新帖速递] 失败：在发送速递消息时发生未知错误: {e}")
-            # 即使速递失败，也继续尝试重建面板
-        
-        # --- 增加战略性延迟以避免速率限制 ---
-        log_with_timestamp("[面板管理] 等待 2 秒，以避免触发速率限制...")
-        await asyncio.sleep(2)
+                # --- 步骤 3: 发送 Embed ---
+                sent_message = await delivery_channel.send(embed=embed)
 
-        # --- 步骤 2b: 重建抽卡面板 ---
-        try:
-            # 1. 查找并删除此频道中任何现有的抽卡面板
-            async for message in delivery_channel.history(limit=100):
-                if message.author == self.bot.user and message.embeds:
-                    if message.embeds[0].title == "🎉 类脑抽抽乐 🎉":
+                # --- 步骤 4: 验证 ---
+                if sent_message and sent_message.embeds:
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ✅ 第 {attempt + 1} 次尝试成功！消息 (ID: {sent_message.id}) 已成功发送。")
+                    
+                    # --- 成功后，异步执行面板重建 ---
+                    async def rebuild_panel():
+                        await asyncio.sleep(2) # 战略性延迟
                         try:
-                            await message.delete()
-                        except discord.HTTPException as e:
-                            # 这个错误通常是 404 Not Found，意味着面板已被删除，可以安全地忽略
-                            print(f"[面板管理] 删除旧面板时出现小问题 (可忽略): {e}")
+                            # 查找并删除旧面板
+                            async for message in delivery_channel.history(limit=100):
+                                if message.author == self.bot.user and message.embeds and message.embeds[0].title == "🎉 类脑抽抽乐 🎉":
+                                    await message.delete()
+                                    break
+                            # 创建新面板
+                            await create_gacha_panel(self.bot, delivery_channel)
+                            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [面板管理] 抽卡面板已成功为帖子 '{thread.name}' 重建。")
+                        except Exception as e:
+                            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [面板管理] 严重错误：为帖子 '{thread.name}' 重建抽卡面板时失败: {e}")
+                    
+                    asyncio.create_task(rebuild_panel())
+                    return # 任务完成，退出函数
+
+                else:
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ⚠️ 第 {attempt + 1} 次尝试失败：API返回了空消息或无效消息对象。将在 {send_retry_delay} 秒后重试...")
+
+            except discord.HTTPException as e:
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ⚠️ 第 {attempt + 1} 次尝试失败：遇到HTTP异常 {e.status} (Code: {e.code})。将在 {send_retry_delay} 秒后重试...")
+            except Exception as e:
+                import traceback
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ❌ 第 {attempt + 1} 次尝试时遇到严重未知错误: {type(e).__name__}: {e}。")
+                print(f"Traceback: {traceback.format_exc()}")
+                # 遇到未知错误，可能重试也无用，直接终止
+                break
             
-            # 2. 创建新的面板
-            await create_gacha_panel(self.bot, delivery_channel)
-        except Exception as e:
-            print(f"[面板管理] 严重错误：重建抽卡面板时失败: {e}")
+            # 如果还未成功，且不是最后一次尝试，则等待
+            if attempt < send_max_attempts - 1:
+                await asyncio.sleep(send_retry_delay)
+
+        # 如果循环完成所有次数都未成功
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ❌ 最终失败：在 {send_max_attempts} 次尝试后，仍未能成功发送关于帖子 '{thread.name}' 的速递。")
+
 
     @tasks.loop(hours=1)
     async def cleanup_old_posts_task(self):
