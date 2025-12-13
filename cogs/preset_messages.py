@@ -114,6 +114,52 @@ class PresetReplyView(discord.ui.View):
         super().__init__(timeout=timeout)
         self.add_item(PresetReplySelect(presets, target_message))
 
+# --- 新增：支持分页的下拉选择视图 ---
+class PaginatedSelectView(discord.ui.View):
+    def __init__(self, all_options: list[str], target_message: discord.Message, *, timeout=180):
+        super().__init__(timeout=timeout)
+        self.all_options = all_options
+        self.target_message = target_message
+        self.current_page = 0
+        self.items_per_page = 25
+        self.total_pages = (len(self.all_options) - 1) // self.items_per_page + 1
+        self.update_view()
+
+    def update_view(self):
+        self.clear_items()
+        
+        start_index = self.current_page * self.items_per_page
+        end_index = start_index + self.items_per_page
+        current_options = self.all_options[start_index:end_index]
+
+        self.add_item(PresetReplySelect(current_options, self.target_message))
+
+        # 仅在需要分页时才显示按钮
+        if self.total_pages > 1:
+            prev_button = discord.ui.Button(label="⬅️ 上一页", style=discord.ButtonStyle.secondary, custom_id="prev_page", disabled=self.current_page == 0)
+            prev_button.callback = self.prev_page_callback
+            
+            page_indicator = discord.ui.Button(label=f"第 {self.current_page + 1}/{self.total_pages} 页", style=discord.ButtonStyle.grey, disabled=True)
+            
+            next_button = discord.ui.Button(label="下一页 ➡️", style=discord.ButtonStyle.secondary, custom_id="next_page", disabled=self.current_page >= self.total_pages - 1)
+            next_button.callback = self.next_page_callback
+
+            self.add_item(prev_button)
+            self.add_item(page_indicator)
+            self.add_item(next_button)
+
+    async def prev_page_callback(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_view()
+            await interaction.response.edit_message(view=self)
+
+    async def next_page_callback(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_view()
+            await interaction.response.edit_message(view=self)
+
 class FuzzySearchReplyView(discord.ui.View):
     """
     一个视图，为模糊搜索到的预设消息提供发送按钮。
@@ -229,9 +275,42 @@ class PresetSearchModal(discord.ui.Modal, title="搜索预设消息"):
             await interaction.response.send_message(f"找不到包含 `{self.keyword.value}` 的预设消息。", ephemeral=True)
             return
 
-        # 将搜索结果以新的视图（包含下拉菜单）发送
-        view = PresetReplyView(search_results, self.target_message)
+        # --- 修改：使用新的分页视图 ---
+        view = PaginatedSelectView(search_results, self.target_message)
         await interaction.response.send_message("请从搜索结果中选择：", view=view, ephemeral=True)
+
+# --- 新增：用于列表命令的分页视图 ---
+class PresetListView(discord.ui.View):
+    def __init__(self, pages: list[discord.Embed], *, timeout=180):
+        super().__init__(timeout=timeout)
+        self.pages = pages
+        self.current_page = 0
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.clear_items()
+        prev_button = discord.ui.Button(label="⬅️ 上一页", style=discord.ButtonStyle.secondary, custom_id="prev_page_list", disabled=self.current_page == 0)
+        prev_button.callback = self.page_callback
+        
+        page_indicator = discord.ui.Button(label=f"第 {self.current_page + 1}/{len(self.pages)} 页", style=discord.ButtonStyle.grey, disabled=True)
+        
+        next_button = discord.ui.Button(label="下一页 ➡️", style=discord.ButtonStyle.secondary, custom_id="next_page_list", disabled=self.current_page >= len(self.pages) - 1)
+        next_button.callback = self.page_callback
+
+        self.add_item(prev_button)
+        self.add_item(page_indicator)
+        self.add_item(next_button)
+
+    async def page_callback(self, interaction: discord.Interaction):
+        if interaction.data['custom_id'] == 'prev_page_list':
+            if self.current_page > 0:
+                self.current_page -= 1
+        elif interaction.data['custom_id'] == 'next_page_list':
+            if self.current_page < len(self.pages) - 1:
+                self.current_page += 1
+        
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current_page], view=self)
 
 class PresetMessageCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -485,11 +564,11 @@ class PresetMessageCog(commands.Cog):
         return [
             app_commands.Choice(name=preset, value=preset)
             for preset in all_presets if current.lower() in preset.lower()
-        ]
+        ][:25]
 
     @preset_group.command(name="列表", description="查看所有可用的预设消息")
     async def list_presets(self, interaction: discord.Interaction):
-        """处理列出预设消息的命令。"""
+        """处理列出预设消息的命令（支持分页）。"""
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
         cur.execute("SELECT name FROM preset_messages WHERE guild_id = ?", (interaction.guild.id,))
@@ -500,19 +579,42 @@ class PresetMessageCog(commands.Cog):
             await interaction.response.send_message("ℹ️ 当前服务器还没有任何预设消息。", ephemeral=True)
             return
 
-        embed = discord.Embed(
-            title=f"📜 {interaction.guild.name} 的预设消息列表",
-            description="以下是所有可用的预设消息名称：",
-            color=discord.Color.green()
-        )
+        # --- 分页逻辑 ---
+        pages = []
+        current_page_content = ""
         
-        # 将预设消息列表格式化为更美观的格式
-        formatted_list = "\n".join(f"- `{name}`" for name in all_presets)
-        embed.add_field(name="可用名称", value=formatted_list, inline=False)
-        
-        embed.set_footer(text=f"共 {len(all_presets)} 条预设消息 | 右键消息 -> 应用 -> 使用预设消息回复")
+        for name in all_presets:
+            line_to_add = f"- `{name}`\n"
+            if len(current_page_content) + len(line_to_add) > 1024:
+                # 当前页已满，创建新的 Embed
+                embed = discord.Embed(
+                    title=f"📜 {interaction.guild.name} 的预设消息列表",
+                    description=current_page_content,
+                    color=discord.Color.green()
+                )
+                embed.set_footer(text=f"共 {len(all_presets)} 条预设消息")
+                pages.append(embed)
+                current_page_content = "" # 重置内容
+            
+            current_page_content += line_to_add
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        # 添加最后一页
+        if current_page_content:
+            embed = discord.Embed(
+                title=f"📜 {interaction.guild.name} 的预设消息列表",
+                description=current_page_content,
+                color=discord.Color.green()
+            )
+            embed.set_footer(text=f"共 {len(all_presets)} 条预设消息")
+            pages.append(embed)
+
+        if not pages:
+             await interaction.response.send_message("🤔 出现了一个奇怪的错误，无法生成列表。", ephemeral=True)
+             return
+
+        # 发送第一页和分页视图
+        view = PresetListView(pages)
+        await interaction.response.send_message(embed=pages[0], view=view, ephemeral=True)
 
     @preset_group.command(name="导入json", description="上传一个JSON文件来批量导入预设消息 (仅限管理员)")
     @app_commands.describe(attachment="包含预设消息的JSON文件")
