@@ -53,8 +53,71 @@ def init_preset_db():
     con.commit()
     con.close()
 
+def init_user_settings_db():
+    """初始化用户设置的数据库表。"""
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            require_confirmation BOOLEAN NOT NULL DEFAULT FALSE,
+            PRIMARY KEY (user_id, guild_id)
+        )
+    ''')
+    con.commit()
+    con.close()
+
 # 在模块加载时立即初始化数据库
 init_preset_db()
+init_user_settings_db()
+
+# --- 新增：发送前确认视图 ---
+class ConfirmSendView(discord.ui.View):
+    def __init__(self, content: str, *, interaction: discord.Interaction, target_message: discord.Message = None, ping_user: discord.Member = None, private_send_user: discord.Member = None, timeout=180):
+        super().__init__(timeout=timeout)
+        self.content = content
+        self.original_interaction = interaction
+        self.target_message = target_message
+        self.ping_user = ping_user
+        self.private_send_user = private_send_user
+
+    async def disable_all_items(self):
+        for item in self.children:
+            item.disabled = True
+        await self.original_interaction.edit_original_response(view=self)
+
+    @discord.ui.button(label="✅ 发送", style=discord.ButtonStyle.green, custom_id="confirm_send")
+    async def confirm_send(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # --- 冷却检查 ---
+        if is_on_cooldown():
+            remaining_time = int(COOLDOWN_DURATION - (time.time() - LAST_USED_TIME))
+            await interaction.response.send_message(f"⏳ **命令冷却中**：请等待 {remaining_time} 秒后再试。", ephemeral=True)
+            return
+
+        update_cooldown() # 更新冷却
+        
+        message_to_send = f"{self.ping_user.mention if self.ping_user else ''}\n{self.content}\n\n——由 {interaction.user.display_name} 发送".strip()
+        
+        try:
+            if self.target_message:
+                await self.target_message.reply(message_to_send)
+            else:
+                await self.original_interaction.channel.send(message_to_send)
+
+            if self.private_send_user:
+                await self.private_send_user.send(message_to_send)
+            
+            await self.disable_all_items()
+            await interaction.response.edit_message(content="✅ **消息已发送！**", embed=None, view=self)
+
+        except discord.HTTPException as e:
+            await interaction.response.edit_message(content=f"❌ **发送失败**：\n`{e}`", embed=None, view=None)
+
+    @discord.ui.button(label="❌ 取消", style=discord.ButtonStyle.red, custom_id="cancel_send")
+    async def cancel_send(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.disable_all_items()
+        await interaction.response.edit_message(content="❌ **操作已取消。**", embed=None, view=self)
 
 class PresetReplySelect(discord.ui.Select):
     def __init__(self, presets: list[str], target_message: discord.Message):
@@ -95,14 +158,22 @@ class PresetReplySelect(discord.ui.Select):
 
         # 如果用户有权限
         if user_roles.intersection(user_role_ids):
-            try:
-                await self.target_message.reply(f"{content}\n\n——由 {interaction.user.display_name} 发送")
-                update_cooldown() # 在成功发送后更新冷却时间
-                # 确认是否私聊发送
-                await interaction.response.edit_message(content="✅ **回复已发送！**", view=None)
-                await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.target_message.author), ephemeral=True)
-            except discord.HTTPException as e:
-                await interaction.response.edit_message(content=f"❌ **回复失败**：无法发送消息。\n`{e}`", view=None)
+            # --- 新增：检查用户是否需要确认 ---
+            cog = interaction.client.get_cog("PresetMessageCog")
+            if await cog._get_user_setting(interaction.user.id, interaction.guild.id):
+                # 发送确认视图
+                embed = discord.Embed(title="预设消息发送确认", description=f"以下是您将要发送的内容预览：\n\n{content[:1000]}{'...' if len(content) > 1000 else ''}", color=discord.Color.blue())
+                view = ConfirmSendView(content, interaction=interaction, target_message=self.target_message)
+                await interaction.response.edit_message(content=None, embed=embed, view=view)
+            else:
+                # 直接发送
+                try:
+                    await self.target_message.reply(f"{content}\n\n——由 {interaction.user.display_name} 发送")
+                    update_cooldown()
+                    await interaction.response.edit_message(content="✅ **回复已发送！**", view=None)
+                    await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.target_message.author), ephemeral=True)
+                except discord.HTTPException as e:
+                    await interaction.response.edit_message(content=f"❌ **回复失败**：无法发送消息。\n`{e}`", view=None)
         # 如果用户没有权限
         else:
             # 对于无权限用户，将消息内容作为临时消息发送给他们自己看
@@ -215,17 +286,28 @@ class FuzzySearchReplyView(discord.ui.View):
 
             # --- 根据权限发送或拒绝 ---
             if user_roles.intersection(user_role_ids):
-                try:
-                    await self.view.target_message.reply(f"{content}\n\n——由 {interaction.user.display_name} 发送")
-                    update_cooldown() # 在成功发送后更新冷却时间
-                    # 确认是否私聊发送
-                    await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.view.target_message.author), ephemeral=True)
-                    # 成功发送后，编辑原消息，禁用所有按钮
+                # --- 新增：检查用户是否需要确认 ---
+                cog = interaction.client.get_cog("PresetMessageCog")
+                if await cog._get_user_setting(interaction.user.id, interaction.guild.id):
+                    # 禁用旧视图按钮
                     for item in self.view.children:
                         item.disabled = True
-                    await interaction.edit_original_response(content=f"✅ **已回复预设消息**：`{preset_name}`", view=self.view)
-                except discord.HTTPException as e:
-                    await interaction.followup.send(f"❌ **发送失败**：\n`{e}`", ephemeral=True)
+                    await interaction.edit_original_response(view=self.view)
+                    # 发送确认视图
+                    embed = discord.Embed(title="预设消息发送确认", description=f"以下是您将要发送的内容预览：\n\n{content[:1000]}{'...' if len(content) > 1000 else ''}", color=discord.Color.blue())
+                    view = ConfirmSendView(content, interaction=interaction, target_message=self.view.target_message)
+                    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+                else:
+                    # 直接发送
+                    try:
+                        await self.view.target_message.reply(f"{content}\n\n——由 {interaction.user.display_name} 发送")
+                        update_cooldown()
+                        await interaction.followup.send(content="是否私聊发送给对方？", view=PrivateFollowUpView(content, target_user=self.view.target_message.author), ephemeral=True)
+                        for item in self.view.children:
+                            item.disabled = True
+                        await interaction.edit_original_response(content=f"✅ **已回复预设消息**：`{preset_name}`", view=self.view)
+                    except discord.HTTPException as e:
+                        await interaction.followup.send(f"❌ **发送失败**：\n`{e}`", ephemeral=True)
             else:
                 # 对于无权限用户，将消息内容作为临时消息发送
                 for item in self.view.children:
@@ -334,6 +416,38 @@ class PresetMessageCog(commands.Cog):
         self.bot.tree.remove_command(self.search_context_menu.name, type=self.search_context_menu.type)
 
     preset_group = app_commands.Group(name="预设消息", description="管理和发送预设消息")
+
+    async def _get_user_setting(self, user_id: int, guild_id: int) -> bool:
+        """获取用户的发送前确认设置，默认为True。"""
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        cur.execute("SELECT require_confirmation FROM user_settings WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+        row = cur.fetchone()
+        con.close()
+        if row is None:
+            return True # 默认需要确认
+        return bool(row[0])
+
+    @preset_group.command(name="设置", description="设置个人预preset消息相关选项。")
+    @app_commands.rename(confirm_before_send='发送前确认')
+    @app_commands.describe(
+        confirm_before_send="选择是否在发送预设消息前进行确认"
+    )
+    async def settings(self, interaction: discord.Interaction, confirm_before_send: bool):
+        """设置发送预设消息前的确认步骤。"""
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO user_settings (user_id, guild_id, require_confirmation)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, guild_id) DO UPDATE SET
+            require_confirmation = excluded.require_confirmation;
+        """, (interaction.user.id, interaction.guild.id, confirm_before_send))
+        con.commit()
+        con.close()
+        
+        status = "开启" if confirm_before_send else "关闭"
+        await interaction.response.send_message(f"✅ **设置已更新**：发送前确认功能已**{status}**。", ephemeral=True)
 
     @preset_group.command(name="添加", description="通过消息链接添加一个新的预设消息。")
     @app_commands.describe(
@@ -711,22 +825,17 @@ class PresetMessageCog(commands.Cog):
         await interaction.response.send_modal(modal)
 
     # --- 修改后的斜杠命令：通过@用户发送 ---
-    @preset_group.command(name="发送给", description="通过@用户并发送预设消息。")
+    @preset_group.command(name="发送", description="发送预设消息，可选择@用户或回复指定消息。")
     @app_commands.describe(
-        user="要@的用户",
         name="要使用的预设消息的名称",
-        send_to_user="是否私聊发送给用户"
+        user="（可选）要@的用户",
+        message_link="（可选）要回复的消息链接",
+        send_to_user="（可选）是否同时私聊发送给@的用户"
     )
-    async def reply_with_preset_slash(self, interaction: discord.Interaction, user: discord.Member, name: str, send_to_user: bool = False):
-        """通过@用户并发送预设消息，模拟回复效果。"""
-        # 检查是否在全局冷却期内
-        if is_on_cooldown():
-            remaining_time = int(COOLDOWN_DURATION - (time.time() - LAST_USED_TIME))
-            await interaction.response.send_message(f"⏳ **命令冷却中**：请等待 {remaining_time} 秒后再试。", ephemeral=True)
-            return
-        
-        # 更新全局冷却时间
-        update_cooldown()
+    async def reply_with_preset_slash(self, interaction: discord.Interaction, name: str, user: discord.Member = None, message_link: str = None, send_to_user: bool = False):
+        """发送预设消息，可选择@用户或回复指定消息。"""
+        # 响应延迟，为后续操作争取时间
+        await interaction.response.defer(ephemeral=True, thinking=True)
         
         # 1. 从数据库获取预设内容
         con = sqlite3.connect(DB_FILE)
@@ -736,36 +845,85 @@ class PresetMessageCog(commands.Cog):
         con.close()
 
         if not row:
-            await interaction.response.send_message(f"❌ **错误**：找不到名为 `{name}` 的预设消息。请检查您的输入。", ephemeral=True)
+            await interaction.followup.send(f"❌ **错误**：找不到名为 `{name}` 的预设消息。", ephemeral=True)
             return
         
         content = row[0]
 
-        # --- 权限检查 ---
+        # 2. 权限检查
         user_role_ids_str = os.getenv("PRESET_USER_ROLE_IDS", "")
         if not user_role_ids_str:
-            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `PRESET_USER_ROLE_IDS`，无法使用此功能。", ephemeral=True)
+            await interaction.followup.send("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `PRESET_USER_ROLE_IDS`。", ephemeral=True)
             return
 
         user_role_ids = {int(rid.strip()) for rid in user_role_ids_str.split(',')}
         user_roles = {role.id for role in interaction.user.roles}
 
-        # 如果用户有权限
-        if user_roles.intersection(user_role_ids):
-            message_to_send = f"{user.mention}\n{content}\n\n——由 {interaction.user.display_name} 发送"
+        if not user_roles.intersection(user_role_ids):
+            user_mention = f"给 {user.mention} " if user else ""
+            ephemeral_content = f"🚫 **权限不足，无法公开{user_mention}发送**\n\n**以下是仅您可见的消息内容：**\n---\n{content}"
+            await interaction.followup.send(ephemeral_content, ephemeral=True)
+            return
+            
+        # 3. 获取目标消息（如果提供了链接）
+        target_message = None
+        if message_link:
+            match = re.match(r'https://discord.com/channels/(\d+)/(\d+)/(\d+)', message_link)
+            if not match:
+                await interaction.followup.send("❌ **链接无效**：请输入一个有效的 Discord 消息链接。", ephemeral=True)
+                return
+            
+            guild_id, channel_id, message_id = map(int, match.groups())
+            if guild_id != interaction.guild.id:
+                await interaction.followup.send("❌ **操作无效**：不能回复其他服务器的消息。", ephemeral=True)
+                return
+
             try:
-                await interaction.channel.send(message_to_send)
-                # 私聊同步发送
-                if send_to_user:
-                    await user.send(message_to_send)
-                await interaction.response.send_message(f"✅ 已向 {user.display_name} 发送预设消息 `{name}`。", ephemeral=True)
-            except discord.HTTPException as e:
-                await interaction.response.send_message(f"❌ **发送失败**：无法发送消息。\n`{e}`", ephemeral=True)
-        # 如果用户没有权限
+                channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+                target_message = await channel.fetch_message(message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                await interaction.followup.send(f"❌ **无法获取消息**：请检查链接或我的权限。\n`{e}`", ephemeral=True)
+                return
+
+        # 4. 检查用户设置并执行操作
+        require_confirmation = await self._get_user_setting(interaction.user.id, interaction.guild.id)
+
+        private_send = user if send_to_user else None
+
+        if require_confirmation:
+            embed = discord.Embed(title="预设消息发送确认", description=f"以下是您将要发送的内容预览：\n\n{content[:1000]}{'...' if len(content) > 1000 else ''}", color=discord.Color.blue())
+            if target_message:
+                embed.add_field(name="回复目标", value=f"[点击跳转]({target_message.jump_url})", inline=False)
+            if user:
+                embed.add_field(name="@的用户", value=user.mention, inline=False)
+            
+            view = ConfirmSendView(content, interaction=interaction, target_message=target_message, ping_user=user, private_send_user=private_send)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
         else:
-            # 对于无权限用户，将消息内容作为临时消息发送给他们自己看
-            ephemeral_content = f"🚫 **权限不足，无法公开发送给 {user.mention}**\n\n**以下是仅您可见的消息内容：**\n---\n{content}"
-            await interaction.response.send_message(ephemeral_content, ephemeral=True)
+            # 直接发送
+            if is_on_cooldown():
+                remaining_time = int(COOLDOWN_DURATION - (time.time() - LAST_USED_TIME))
+                await interaction.followup.send(f"⏳ **命令冷却中**：请等待 {remaining_time} 秒后再试。", ephemeral=True)
+                return
+            
+            update_cooldown()
+            message_to_send = f"{user.mention if user else ''}\n{content}\n\n——由 {interaction.user.display_name} 发送".strip()
+            
+            try:
+                if target_message:
+                    await target_message.reply(message_to_send)
+                    response_message = f"✅ 已回复指定消息并发送预设 `{name}`。"
+                else:
+                    await interaction.channel.send(message_to_send)
+                    response_message = f"✅ 已在当前频道发送预设 `{name}`。"
+                
+                if private_send:
+                    await private_send.send(message_to_send)
+                
+                await interaction.followup.send(response_message, ephemeral=True)
+
+            except discord.HTTPException as e:
+                await interaction.followup.send(f"❌ **发送失败**：\n`{e}`", ephemeral=True)
 
     @reply_with_preset_slash.autocomplete('name')
     async def reply_with_preset_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
