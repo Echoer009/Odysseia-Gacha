@@ -571,7 +571,7 @@ class PresetMessageCog(commands.Cog):
         """处理列出预设消息的命令（支持分页）。"""
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
-        cur.execute("SELECT name FROM preset_messages WHERE guild_id = ?", (interaction.guild.id,))
+        cur.execute("SELECT name FROM preset_messages WHERE guild_id = ? ORDER BY name", (interaction.guild.id,))
         all_presets = [row[0] for row in cur.fetchall()]
         con.close()
 
@@ -579,14 +579,17 @@ class PresetMessageCog(commands.Cog):
             await interaction.response.send_message("ℹ️ 当前服务器还没有任何预设消息。", ephemeral=True)
             return
 
-        # --- 分页逻辑 ---
+        # --- 分页逻辑 (最终修复版：基于字节长度) ---
         pages = []
         current_page_content = ""
-        
         for name in all_presets:
             line_to_add = f"- `{name}`\n"
-            if len(current_page_content) + len(line_to_add) > 1024:
-                # 当前页已满，创建新的 Embed
+            # 使用UTF-8编码计算字节长度，与Discord API标准对齐
+            line_bytes_len = len(line_to_add.encode('utf-8'))
+            content_bytes_len = len(current_page_content.encode('utf-8'))
+
+            # 如果当前页面非空，并且加入新行后会超长，则将当前页打包
+            if current_page_content and content_bytes_len + line_bytes_len > 1024:
                 embed = discord.Embed(
                     title=f"📜 {interaction.guild.name} 的预设消息列表",
                     description=current_page_content,
@@ -594,11 +597,13 @@ class PresetMessageCog(commands.Cog):
                 )
                 embed.set_footer(text=f"共 {len(all_presets)} 条预设消息")
                 pages.append(embed)
-                current_page_content = "" # 重置内容
-            
-            current_page_content += line_to_add
+                # 新页面以当前行开始
+                current_page_content = line_to_add
+            else:
+                # 否则，继续向当前页添加内容
+                current_page_content += line_to_add
 
-        # 添加最后一页
+        # 添加最后一页（如果还有内容）
         if current_page_content:
             embed = discord.Embed(
                 title=f"📜 {interaction.guild.name} 的预设消息列表",
