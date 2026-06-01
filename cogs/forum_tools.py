@@ -9,7 +9,7 @@ import sqlite3
 from typing import Optional
 import datetime
 from dotenv import set_key, unset_key
-from .random_post import create_gacha_panel
+from .random_post import create_gacha_panel, format_post_embed
 import json
 
 # --- 数据库文件路径 ---
@@ -219,34 +219,8 @@ class ForumTools(commands.Cog):
                     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ❌ 失败：机器人权限不足，无法获取帖子 '{thread.name}' 的起始消息。已终止对此帖的速递。")
                     return # 权限问题无法通过重试解决，直接返回
 
-                # --- 步骤 2: 在每次循环内部构建 Embed ---
-                author_mention = f"**👤 作者:** {thread.owner.name}" if thread.owner else f"**👤 作者:** 未知"
-                thread_title = thread.name[:97] + "..." if len(thread.name) > 100 else thread.name
-                header_line = f"**{thread_title}** | {author_mention}"
-
-                if starter_message and starter_message.content:
-                    post_content = starter_message.content
-                    if len(post_content) > 400:
-                        post_content = post_content[:400] + "..."
-                    content_section = f"**📝 内容速览:**\n{post_content}"
-                else:
-                    content_section = "**📝 内容速览:**\n*(无法加载起始消息，可能已被删除或帖子格式特殊)*"
-                
-                full_description = f"{header_line}\n\n{content_section}"
-                embed = discord.Embed(title="✨ 新卡速递", description=full_description, color=discord.Color.blue())
-                embed.add_field(name="🚪 传送门", value=f"[点击查看原帖]({thread.jump_url})", inline=False)
-
-                if starter_message and starter_message.attachments:
-                    for attachment in starter_message.attachments:
-                        if attachment.content_type and attachment.content_type.startswith('image/'):
-                            embed.set_thumbnail(url=attachment.url)
-                            break
-                
-                if thread.applied_tags:
-                    tags_str = ", ".join(tag.name for tag in thread.applied_tags)
-                    if len(tags_str) > 1024:
-                        tags_str = tags_str[:1021] + "..."
-                    embed.add_field(name="🏷️ 标签", value=tags_str, inline=False)
+                # --- 步骤 2: 构建 Embed（委托给公共函数） ---
+                embed = await format_post_embed(thread, starter_message=starter_message)
 
                 print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [诊断日志] 准备为帖子 '{thread.name}' (ID: {thread.id}) 发送以下 Embed 内容:\n{embed.to_dict()}")
 

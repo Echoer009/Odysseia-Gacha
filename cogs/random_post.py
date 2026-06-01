@@ -43,64 +43,95 @@ def init_db():
     con.close()
 
 # --- 格式化帖子为 Embed 的辅助函数 ---
-async def format_post_embed(interaction: discord.Interaction, thread: discord.Thread, title_prefix: str = "✨ 新卡速递") -> discord.Embed:
-    """将一个帖子对象格式化为类似于新帖速递的嵌入式消息。"""
+async def format_post_embed(
+    thread: discord.Thread,
+    title_prefix: str = "✨ 新卡速递",
+    *,
+    interaction: Optional[discord.Interaction] = None,
+    starter_message: Optional[discord.Message] = None,
+) -> discord.Embed:
+    """将一个帖子对象格式化为嵌入式消息。可由外部传入 starter_message 以跳过内部获取。"""
     try:
-        starter_message = thread.starter_message
-        if not starter_message:
-            max_retries = 3
-            retry_delay = 2  # 秒
-            for attempt in range(max_retries):
-                try:
-                    starter_message = await thread.fetch_message(thread.id)
-                    break  # 获取成功，跳出循环
-                except discord.errors.DiscordServerError as e:
-                    if attempt < max_retries - 1:
-                        print(f"[抽卡模块] 获取帖子 {thread.id} 时遇到服务器503错误，将在 {retry_delay} 秒后重试...")
-                        await asyncio.sleep(retry_delay)
-                    else:
-                        print(f"[抽卡模块] 获取帖子 {thread.id} 失败，已达到最大重试次数。")
-                        raise e  # 重试耗尽，将最终错误抛出，由外层except处理
-        
-        # 确保 starter_message 不为 None
         if starter_message is None:
-            raise ValueError("无法获取帖子的起始消息")
-        
-        author_mention = f"**👤 作者:** {thread.owner.name}" if thread.owner else f"**👤 作者:** 未知"
-        header_line = f"**{thread.name}** | {author_mention}"
-        
-        post_content = starter_message.content or ""
-        if len(post_content) > 400:
-            post_content = post_content[:400] + "..."
-        content_section = f"**📝 内容速览:**\n{post_content}"
-        full_description = f"{header_line}\n\n{content_section}"
+            starter_message = thread.starter_message
+            if not starter_message:
+                max_retries = 3
+                retry_delay = 2
+                for attempt in range(max_retries):
+                    try:
+                        starter_message = await thread.fetch_message(thread.id)
+                        break
+                    except discord.errors.DiscordServerError:
+                        if attempt < max_retries - 1:
+                            print(f"[抽卡模块] 获取帖子 {thread.id} 时遇到服务器503错误，将在 {retry_delay} 秒后重试...")
+                            await asyncio.sleep(retry_delay)
+                        else:
+                            print(f"[抽卡模块] 获取帖子 {thread.id} 失败，已达到最大重试次数。")
+
+        author_name = "未知作者"
+        author_avatar = None
+        if thread.owner:
+            author_name = thread.owner.display_name
+            author_avatar = thread.owner.display_avatar.url
+        elif thread.owner_id:
+            member = thread.guild.get_member(thread.owner_id)
+            if member:
+                author_name = member.display_name
+                author_avatar = member.display_avatar.url
+
+        thread_title = thread.name[:97] + "..." if len(thread.name) > 100 else thread.name
+
+        if starter_message and starter_message.content:
+            post_content = starter_message.content
+            if len(post_content) > 400:
+                post_content = post_content[:400] + "..."
+            content_section = f"**📝 内容速览:**\n{post_content}"
+        else:
+            content_section = "**📝 内容速览:**\n*(无法加载起始消息，可能已被删除或帖子格式特殊)*"
+
+        full_description = f"**{thread_title}**\n\n{content_section}"
 
         embed = discord.Embed(
             title=title_prefix,
             description=full_description,
             color=discord.Color.blue()
         )
+        if author_avatar:
+            embed.set_author(name=author_name, icon_url=author_avatar)
+        else:
+            embed.set_author(name=author_name)
+
         embed.add_field(name="🚪 传送门", value=f"[点击查看原帖]({thread.jump_url})", inline=False)
 
-        if starter_message.attachments:
+        if starter_message and starter_message.attachments:
             for attachment in starter_message.attachments:
                 if attachment.content_type and attachment.content_type.startswith('image/'):
-                    embed.set_thumbnail(url=attachment.url)
+                    embed.set_image(url=attachment.url)
                     break
 
         if thread.applied_tags:
             tags_str = ", ".join(tag.name for tag in thread.applied_tags)
+            if len(tags_str) > 1024:
+                tags_str = tags_str[:1021] + "..."
             embed.add_field(name="🏷️ 标签", value=tags_str, inline=False)
-        
-        parent_name = thread.parent.name if thread.parent else "未知论坛"
-        embed.set_footer(text=f"来自论坛: {parent_name}")
+
+        parent = thread.parent
+        if parent:
+            category = parent.category
+            footer_text = f"📂 {category.name} / {parent.name}" if category else f"📂 {parent.name}"
+        else:
+            footer_text = "📂 未知来源"
+        embed.set_footer(text=footer_text)
+        embed.timestamp = thread.created_at
+
         return embed
     except Exception as e:
         log_message = (
             f"Error formatting embed for thread ID {thread.id} ('{thread.name}') "
-            f"in forum '{thread.parent.name if thread.parent else 'N/A'}'. "
-            f"Triggered by {interaction.user} ({interaction.user.id})."
+            f"in forum '{thread.parent.name if thread.parent else 'N/A'}'."
         )
+        if interaction:
+            log_message += f" Triggered by {interaction.user} ({interaction.user.id})."
         logging.exception(log_message)
         return discord.Embed(title="错误", description=f"无法加载帖子 {thread.name} 的信息。", color=discord.Color.red())
 
@@ -404,7 +435,7 @@ class RandomPostView(discord.ui.View):
                             continue
 
                         title = f"✨ ({i+1-not_found_count}/{draw_count})" if count > 1 else "✨ 你的天选之帖"
-                        embed = await format_post_embed(interaction, thread, title_prefix=title)
+                        embed = await format_post_embed(thread, title_prefix=title, interaction=interaction)
                         
                         if embed.title == "错误":
                             not_found_count += 1
