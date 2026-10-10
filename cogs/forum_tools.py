@@ -8,7 +8,7 @@ import os
 import sqlite3
 from typing import Optional
 import datetime
-from dotenv import set_key, unset_key
+from dotenv import set_key
 from .random_post import create_gacha_panel, format_post_embed
 import json
 
@@ -176,7 +176,7 @@ class ForumTools(commands.Cog):
     async def _send_delivery_with_retries(self, thread: discord.Thread):
         """
         一个独立的、带重试逻辑的异步任务，用于构建和发送新帖速递。
-        每次重试都会从头开始构建 Embed。
+        支持多服务器多频道: 会投递到帖子所属服务器配置的所有速递频道。
         """
         # --- 从 .env 加载速递相关配置, 提供默认值 ---
         try:
@@ -189,18 +189,29 @@ class ForumTools(commands.Cog):
             send_max_attempts = 5
             send_retry_delay = 60.0
 
-        delivery_channel_id = self.bot.delivery_channel_id
-        if not delivery_channel_id:
-            return
-        
-        delivery_channel = self.bot.get_channel(delivery_channel_id)
-        if not delivery_channel:
-            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ❌ 错误：在 .env 中配置的速递频道ID {delivery_channel_id} 找不到。")
+        # --- 解析帖子所属服务器配置的所有速递频道 ---
+        delivery_channels = []
+        for channel_id in self.bot.get_delivery_channels(thread.guild.id):
+            channel = self.bot.get_channel(channel_id)
+            if channel:
+                delivery_channels.append(channel)
+            else:
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ⚠️ 速递频道ID {channel_id} 找不到，已跳过。")
+        if not delivery_channels:
             return
 
         # --- 首次尝试前的初始延迟 ---
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] 检测到新帖 '{thread.name}'。等待 {fetch_delay} 秒，以确保CDN资源就绪...")
         await asyncio.sleep(fetch_delay)
+
+        for channel in delivery_channels:
+            await self._deliver_to_channel(thread, channel, send_max_attempts, send_retry_delay)
+
+    async def _deliver_to_channel(self, thread: discord.Thread, delivery_channel: discord.TextChannel, send_max_attempts: int, send_retry_delay: float):
+        """
+        向单个速递频道投递一篇新帖的速递, 带重试逻辑。
+        每次重试都会从头开始构建 Embed。
+        """
 
         for attempt in range(send_max_attempts):
             try:
@@ -266,23 +277,24 @@ class ForumTools(commands.Cog):
                 await asyncio.sleep(send_retry_delay)
 
         # 如果循环完成所有次数都未成功
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ❌ 最终失败：在 {send_max_attempts} 次尝试后，仍未能成功发送关于帖子 '{thread.name}' 的速递。")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [新帖速递] ❌ 最终失败：在 {send_max_attempts} 次尝试后，仍未能成功发送关于帖子 '{thread.name}' 到速递频道 '#{delivery_channel.name}' 的速递。")
 
 
     @tasks.loop(hours=1)
     async def cleanup_old_posts_task(self):
-        """后台任务，每小时运行一次，清理超过24小时的速递消息。"""
+        """后台任务，每小时运行一次，清理所有速递频道中超过24小时的速递消息。"""
         await self.bot.wait_until_ready()
-        
-        delivery_channel_id = self.bot.delivery_channel_id
-        if not delivery_channel_id:
-            return # 如果没有设置速递频道，则不执行任何操作
 
-        channel = self.bot.get_channel(delivery_channel_id)
-        if not channel:
-            return
+        all_channel_ids = set()
+        for channels in self.bot.delivery_channels.values():
+            all_channel_ids.update(channels)
+        for channel_id in all_channel_ids:
+            channel = self.bot.get_channel(channel_id)
+            if channel:
+                await self._cleanup_channel(channel)
 
-        # print(f"[清理任务] 开始检查频道 '{channel.name}' 中的旧帖子...") # 注释掉，以减少不必要的日志
+    async def _cleanup_channel(self, channel):
+        """清理单个速递频道中超过24小时的速递消息。"""
         deleted_count = 0
         
         # 计算24小时前的时间点
@@ -390,38 +402,10 @@ class ForumTools(commands.Cog):
         
         await interaction.followup.send(f"✅ **全量同步完成！** 本次新增了 **{total_added}** 个帖子到总卡池中。", ephemeral=True)
 
-    @config_group.command(name="设置速递频道", description="【重要】设置或更新新帖速递的目标频道。")
-    @app_commands.describe(channel="要设置为速递目标的文本频道")
-    async def set_delivery_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        """处理设置速递频道的命令。"""
-        # --- 权限检查 (复用 ADMIN_ROLE_IDS) ---
-        admin_role_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
-        if not admin_role_ids_str:
-            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `ADMIN_ROLE_IDS`。", ephemeral=True)
-            return
-        admin_role_ids = {int(rid.strip()) for rid in admin_role_ids_str.split(',')}
-        user_roles = {role.id for role in interaction.user.roles}
-        if not user_roles.intersection(admin_role_ids):
-            await interaction.response.send_message("🚫 **权限不足**：只有拥有特定管理员身份组的用户才能执行此操作。", ephemeral=True)
-            return
-        
-        try:
-            dotenv_path = os.path.join(os.getcwd(), '.env')
-            await asyncio.to_thread(set_key, dotenv_path, "DELIVERY_CHANNEL_ID", str(channel.id))
-            
-            self.bot.delivery_channel_id = channel.id
-            
-            await interaction.response.send_message(
-                f"✅ **成功!** 新帖速递频道已更新为 {channel.mention}。\n"
-                f"**重要提示**: 此更改已写入 `.env` 文件，但为了确保所有功能完全同步，建议您在方便时**重启机器人**。",
-                ephemeral=True
-            )
-        except Exception as e:
-            await interaction.response.send_message(f"❌ **写入 .env 文件失败**: `{e}`", ephemeral=True)
-
-    @config_group.command(name="移除速递频道", description="【重要】禁用新帖速递功能。")
-    async def unset_delivery_channel(self, interaction: discord.Interaction):
-        """处理移除速递频道的命令。"""
+    @config_group.command(name="添加速递频道", description="【重要】为当前服务器添加一个新帖速递目标频道，支持多个。")
+    @app_commands.describe(channel="要添加为速递目标的文本频道")
+    async def add_delivery_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        """处理添加速递频道的命令 (多服务器多频道)。"""
         # --- 权限检查 (复用 ADMIN_ROLE_IDS) ---
         admin_role_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
         if not admin_role_ids_str:
@@ -433,19 +417,91 @@ class ForumTools(commands.Cog):
             await interaction.response.send_message("🚫 **权限不足**：只有拥有特定管理员身份组的用户才能执行此操作。", ephemeral=True)
             return
 
+        guild_id = interaction.guild_id
+        channels = self.bot.delivery_channels.setdefault(guild_id, set())
+        if channel.id in channels:
+            await interaction.response.send_message(f"ℹ️ 频道 {channel.mention} 已经是本服务器的速递频道了。", ephemeral=True)
+            return
+
         try:
-            dotenv_path = os.path.join(os.getcwd(), '.env')
-            await asyncio.to_thread(unset_key, dotenv_path, "DELIVERY_CHANNEL_ID")
-
-            self.bot.delivery_channel_id = None
-
-            await interaction.response.send_message(
-                f"✅ **成功!** 已禁用新帖速递功能。\n"
-                f"**重要提示**: 此更改已写入 `.env` 文件，但为了确保所有功能完全同步，建议您在方便时**重启机器人**。",
-                ephemeral=True
-            )
+            channels.add(channel.id)
+            await asyncio.to_thread(self.bot.save_delivery_channels)
         except Exception as e:
-            await interaction.response.send_message(f"❌ **写入 .env 文件失败**: `{e}`", ephemeral=True)
+            channels.discard(channel.id)
+            await interaction.response.send_message(f"❌ **写入配置文件失败**: `{e}`", ephemeral=True)
+            return
+
+        # 在新频道立即创建抽卡面板, 避免要等到下一篇新帖才有内容
+        try:
+            await create_gacha_panel(self.bot, channel)
+        except Exception as e:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [面板管理] 在新速递频道 {channel.name} 创建抽卡面板失败: {e}")
+
+        await interaction.response.send_message(
+            f"✅ **成功!** 已为服务器 **{interaction.guild.name}** 添加速递频道 {channel.mention} (共 {len(channels)} 个)。更改即时生效。",
+            ephemeral=True
+        )
+
+    @config_group.command(name="移除速递频道", description="【重要】从当前服务器的速递频道列表中移除一个频道。")
+    @app_commands.describe(channel="要移除的速递目标频道")
+    async def remove_delivery_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        """处理移除速递频道的命令 (多服务器多频道)。"""
+        # --- 权限检查 (复用 ADMIN_ROLE_IDS) ---
+        admin_role_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
+        if not admin_role_ids_str:
+            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `ADMIN_ROLE_IDS`。", ephemeral=True)
+            return
+        admin_role_ids = {int(rid.strip()) for rid in admin_role_ids_str.split(',')}
+        user_roles = {role.id for role in interaction.user.roles}
+        if not user_roles.intersection(admin_role_ids):
+            await interaction.response.send_message("🚫 **权限不足**：只有拥有特定管理员身份组的用户才能执行此操作。", ephemeral=True)
+            return
+
+        guild_id = interaction.guild_id
+        channels = self.bot.delivery_channels.get(guild_id, set())
+        if channel.id not in channels:
+            await interaction.response.send_message(f"ℹ️ 频道 {channel.mention} 不在本服务器的速递频道列表中。", ephemeral=True)
+            return
+
+        try:
+            channels.discard(channel.id)
+            if not channels:
+                self.bot.delivery_channels.pop(guild_id, None)
+            await asyncio.to_thread(self.bot.save_delivery_channels)
+        except Exception as e:
+            channels.add(channel.id)
+            await interaction.response.send_message(f"❌ **写入配置文件失败**: `{e}`", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"✅ **成功!** 已将 {channel.mention} 从服务器 **{interaction.guild.name}** 的速递频道中移除 (剩余 {len(channels)} 个)。更改即时生效。",
+            ephemeral=True
+        )
+
+    @config_group.command(name="速递频道列表", description="查看当前服务器已配置的所有速递频道。")
+    async def list_delivery_channels(self, interaction: discord.Interaction):
+        """处理查看速递频道列表的命令。"""
+        # --- 权限检查 (复用 ADMIN_ROLE_IDS) ---
+        admin_role_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
+        if not admin_role_ids_str:
+            await interaction.response.send_message("❌ **配置错误**：机器人管理员尚未在 `.env` 文件中配置 `ADMIN_ROLE_IDS`。", ephemeral=True)
+            return
+        admin_role_ids = {int(rid.strip()) for rid in admin_role_ids_str.split(',')}
+        user_roles = {role.id for role in interaction.user.roles}
+        if not user_roles.intersection(admin_role_ids):
+            await interaction.response.send_message("🚫 **权限不足**：只有拥有特定管理员身份组的用户才能执行此操作。", ephemeral=True)
+            return
+
+        channels = self.bot.delivery_channels.get(interaction.guild_id, set())
+        if not channels:
+            await interaction.response.send_message("ℹ️ 本服务器尚未配置任何速递频道，使用 `/设置 添加速递频道` 来添加。", ephemeral=True)
+            return
+
+        lines = [f"**{interaction.guild.name}** 的速递频道 (共 {len(channels)} 个):"]
+        for channel_id in sorted(channels):
+            ch = self.bot.get_channel(channel_id)
+            lines.append(f"- {ch.mention if ch else f'⚠️ 未找到 (ID: {channel_id})'}")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     @config_group.command(name="添加监控论坛", description="【重要】添加一个新的论坛频道到监控列表。")
     @app_commands.describe(channel="要添加的论坛频道")

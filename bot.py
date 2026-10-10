@@ -2,10 +2,13 @@
 import os
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
+from dotenv import load_dotenv, unset_key
 import asyncio
 from typing import Literal, Optional
 import json
+
+# --- 速递频道配置文件 (多服务器 x 多频道) ---
+DELIVERY_CONFIG_FILE = 'delivery_config.json'
 
 # --- 初始化 ---
 # 加载 .env 文件中的环境变量
@@ -29,8 +32,52 @@ class MyBot(commands.Bot):
         super().__init__(command_prefix="odysseia!", intents=intents)
         # --- 统一配置处理 ---
         self.allowed_forum_ids = {int(cid.strip()) for cid in ALLOWED_CHANNEL_IDS_STR.split(',') if cid.strip()}
-        self.delivery_channel_id = int(DELIVERY_CHANNEL_ID_STR) if DELIVERY_CHANNEL_ID_STR else None
+        # --- 多服务器多频道速递配置: {guild_id: {channel_id, ...}} ---
+        self.delivery_channels = self._load_delivery_channels()
         self.default_pool_exclusions = {int(cid.strip()) for cid in DEFAULT_POOL_EXCLUSION_IDS_STR.split(',') if cid.strip()}
+
+    def _load_delivery_channels(self) -> dict:
+        """从 delivery_config.json 加载速递频道配置。文件不存在时返回空配置。"""
+        try:
+            with open(DELIVERY_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            return {int(gid): {int(cid) for cid in channels} for gid, channels in raw.items()}
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            print(f"⚠️ 读取速递频道配置文件 {DELIVERY_CONFIG_FILE} 失败: {e}")
+            return {}
+
+    def save_delivery_channels(self):
+        """将当前的速递频道配置持久化到 delivery_config.json。"""
+        raw = {str(gid): sorted(channels) for gid, channels in self.delivery_channels.items() if channels}
+        with open(DELIVERY_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
+
+    def get_delivery_channels(self, guild_id: int) -> set:
+        """获取指定服务器的所有速递频道 ID。"""
+        return self.delivery_channels.get(guild_id, set())
+
+    def _migrate_legacy_delivery_channel(self):
+        """一次性迁移: 将旧版 .env 中的单一 DELIVERY_CHANNEL_ID 迁入 delivery_config.json。"""
+        if not DELIVERY_CHANNEL_ID_STR:
+            return
+        try:
+            legacy_id = int(DELIVERY_CHANNEL_ID_STR)
+        except ValueError:
+            print(f"⚠️ .env 中的 DELIVERY_CHANNEL_ID 值无效: {DELIVERY_CHANNEL_ID_STR}，已忽略。")
+            return
+        channel = self.get_channel(legacy_id)
+        if channel is None:
+            print(f"⚠️ 旧速递频道 (ID: {legacy_id}) 暂时无法解析，保留 .env 配置，下次启动重试迁移。")
+            return
+        guild_id = channel.guild.id
+        channels = self.delivery_channels.setdefault(guild_id, set())
+        if legacy_id not in channels:
+            channels.add(legacy_id)
+            self.save_delivery_channels()
+        unset_key(os.path.join(os.getcwd(), '.env'), "DELIVERY_CHANNEL_ID")
+        print(f"✅ 已将旧版速递频道 {channel.name} (ID: {legacy_id}) 迁移到 {DELIVERY_CONFIG_FILE} (服务器 {guild_id})。")
 
     async def setup_hook(self):
         """
@@ -99,14 +146,20 @@ class MyBot(commands.Bot):
         else:
             print("⚠️ 未在 .env 文件中找到或加载任何 ALLOWED_CHANNEL_IDS。")
 
-        if self.delivery_channel_id:
-            channel = self.get_channel(self.delivery_channel_id)
-            if channel:
-                print(f"✅ 速递频道已设置为: {channel.name} (ID: {self.delivery_channel_id})")
-            else:
-                print(f"⚠️ 未找到速递频道 (ID: {self.delivery_channel_id})")
+        # --- 迁移旧版 .env 单频道配置, 并打印当前速递频道 ---
+        self._migrate_legacy_delivery_channel()
+        if self.delivery_channels:
+            total_channels = sum(len(channels) for channels in self.delivery_channels.values())
+            print(f"✅ 速递频道已配置: {len(self.delivery_channels)} 个服务器, 共 {total_channels} 个频道:")
+            for guild_id, channel_ids in self.delivery_channels.items():
+                for channel_id in channel_ids:
+                    channel = self.get_channel(channel_id)
+                    if channel:
+                        print(f"  - 服务器 {guild_id}: {channel.name} (ID: {channel_id})")
+                    else:
+                        print(f"  - 服务器 {guild_id}: 未找到频道 (ID: {channel_id})")
         else:
-            print("ℹ️ 未在 .env 文件中配置速递频道 (DELIVERY_CHANNEL_ID)。")
+            print("ℹ️ 尚未配置任何速递频道 (可使用 /设置 添加速递频道)")
         print("--- .env 配置加载完毕 ---\n")
 
 

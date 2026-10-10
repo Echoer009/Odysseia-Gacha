@@ -26,3 +26,4 @@ __pycache__/
 
 # Ignore macOS specific files
 .DS_Store
+delivery_config.json
