@@ -54,9 +54,12 @@ class MyBot(commands.Bot):
         with open(DELIVERY_CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(raw, f, ensure_ascii=False, indent=2)
 
-    def get_delivery_channels(self, guild_id: int) -> set:
-        """获取指定服务器的所有速递频道 ID。"""
-        return self.delivery_channels.get(guild_id, set())
+    def get_delivery_channels(self) -> set:
+        """获取所有服务器已配置的全部速递频道 ID (全局广播用)。"""
+        all_ids = set()
+        for channels in self.delivery_channels.values():
+            all_ids.update(channels)
+        return all_ids
 
     def _migrate_legacy_delivery_channel(self):
         """一次性迁移: 将旧版 .env 中的单一 DELIVERY_CHANNEL_ID 迁入 delivery_config.json。"""

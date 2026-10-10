@@ -176,7 +176,7 @@ class ForumTools(commands.Cog):
     async def _send_delivery_with_retries(self, thread: discord.Thread):
         """
         一个独立的、带重试逻辑的异步任务，用于构建和发送新帖速递。
-        支持多服务器多频道: 会投递到帖子所属服务器配置的所有速递频道。
+        全局广播: 任何被监听论坛的新帖都会投递到所有已配置的速递频道 (跨服务器)。
         """
         # --- 从 .env 加载速递相关配置, 提供默认值 ---
         try:
@@ -189,9 +189,9 @@ class ForumTools(commands.Cog):
             send_max_attempts = 5
             send_retry_delay = 60.0
 
-        # --- 解析帖子所属服务器配置的所有速递频道 ---
+        # --- 解析所有已配置的速递频道 (全局广播: 任何被监听论坛的新帖都发到全部频道) ---
         delivery_channels = []
-        for channel_id in self.bot.get_delivery_channels(thread.guild.id):
+        for channel_id in sorted(self.bot.get_delivery_channels()):
             channel = self.bot.get_channel(channel_id)
             if channel:
                 delivery_channels.append(channel)
